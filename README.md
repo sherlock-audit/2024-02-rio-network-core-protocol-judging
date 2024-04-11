@@ -274,6 +274,26 @@ Manual Review
 ## Recommendation
 Update the withdrawal queue when the operator registry admin changes the EigenLayer shares amount by either removing an operator or setting its strategy cap to "0".
 
+
+
+## Discussion
+
+**solimander**
+
+Largely sounds like a duplicate of https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/361.
+
+**solimander**
+
+While the duplicates linked in this issue all look valid, but are related to the failure to zero out the strategy allocation after setting the strategy cap to 0.
+
+**solimander**
+
+This PR fixes the linked duplicates: https://github.com/rio-org/rio-sherlock-audit/pull/14
+
+**solimander**
+
+@nevillehuang This issue seems to be a duplicate of https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/361, while all linked duplicates point to a slightly different issue where allocation is not zeroed out when force exiting an operator.
+
 # Issue H-3: Malicious operators can `undelegate` theirselves to manipulate the LRT exchange rate 
 
 Source: https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/53 
@@ -398,6 +418,12 @@ Rio should also consider reducing the incentives for an operator to act maliciou
 **nevillehuang**
 
 Since operators are not trusted in the context of rio-protocol, I believe high severity to be appropriate since this allows direct stealing of material amount of funds
+
+**sherlock-admin4**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/rio-org/rio-sherlock-audit/pull/12
+
 
 # Issue H-5: swapValidatorDetails incorrectly writes keys to memory, resulting in permanently locked beacon chain deposits 
 
@@ -565,7 +591,110 @@ Note that the above change must be made for both keys.
 
 The protocol team fixed this issue in PR/commit https://github.com/rio-org/rio-sherlock-audit/pull/2.
 
-# Issue H-6: `reportOutOfOrderValidatorExits` does not updates the heap order 
+# Issue H-6: Requested withdrawal can be impossible to settle due to EigenLayer shares value appreciate when there are idle funds in deposit pool 
+
+Source: https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/109 
+
+## Found by 
+g, mstpr-brainbot, zzykxx
+## Summary
+When users request a withdrawal, the EigenLayer shares equivalent to their LRT's value are recorded. During settlement, these EigenLayer shares must be deducted to finalize the withdrawal epoch. However, in certain scenarios, the requested EigenLayer shares may be impossible to unwind due to funds idling in the deposit pool. 
+## Vulnerability Detail
+Let's assume that 1 LRT equals 1 EigenLayer-cbETH, which equals 1 cbETH initially.
+
+Alice deposits 5e18 cbETH, and her deposits are allocated to operators after rebalancing. Now, Rio holds 5 EigenLayer-cbETH, which is worth 5 cbETH.
+
+After some time, Bob deposits 100e18 cbETH to Rio and immediately withdraws it. At the time Bob requests this withdrawal, 100 cbETH is worth 100 EigenLayer-cbETH, so the shares owed are 100 EigenLayer-cbETH. At settlement, 100 EigenLayer-cbETH worth of cbETH has to be sent to the withdrawal queue to settle this epoch.
+
+Now, assume that the value of EigenLayer-cbETH increases, meaning that 1 EigenLayer-cbETH is now worth more cbETH. This is an expected behavior because EigenLayer-cbETH is similar to an ERC4626 vault, and we expect its value to increase over time.
+
+Let's say 1 EigenLayer-cbETH is now worth 1.1 cbETH.
+
+Now, 100 cbETH sits idle in the deposit pool, and there are 5 EigenLayer-cbETH in the operators, which means there are a total of 90.9 + 5 = 95.9 EigenLayer-cbETH worth of cbETH in Rio. However, Bob's withdrawal request is for 100 EigenLayer-cbETH.
+
+This would mean that Bob's withdrawal request will not be settled, and the entire withdrawal flow will be stuck because this epoch can't be settled.
+
+
+
+**Coded PoC:**
+```solidity
+ // forge test --match-contract RioLRTDepositPoolTest --match-test test_InsufficientSharesInWithdrawal -vv
+    function test_InsufficientSharesInWithdrawal() public {
+        uint8 operatorId = addOperatorDelegator(reLST.operatorRegistry, address(reLST.rewardDistributor));
+        address operatorDelegator = reLST.operatorRegistry.getOperatorDetails(operatorId).delegator;
+
+        uint256 AMOUNT = 5e18;
+
+        // Allocate to cbETH strategy.
+        cbETH.approve(address(reLST.coordinator), type(uint256).max);
+        reLST.coordinator.deposit(CBETH_ADDRESS, AMOUNT);
+        console.log("SHARES HELD", reLST.assetRegistry.getAssetSharesHeld(CBETH_ADDRESS));
+
+        // Push funds into EigenLayer.
+        vm.prank(EOA, EOA);
+        reLST.coordinator.rebalance(CBETH_ADDRESS);
+
+        assertEq(cbETH.balanceOf(address(reLST.depositPool)), 0);
+        assertEq(reLST.assetRegistry.getAssetSharesHeld(CBETH_ADDRESS), AMOUNT);
+        console.log("SHARES HELD", reLST.assetRegistry.getAssetSharesHeld(CBETH_ADDRESS));
+
+        // @review before rebalance, deposit 100 * 1e18
+        reLST.coordinator.deposit(CBETH_ADDRESS, 100e18);
+
+        // @review request withdrawal 
+        reLST.coordinator.requestWithdrawal(CBETH_ADDRESS, 100e18);
+        console.log("SHARES HELD", reLST.assetRegistry.getAssetSharesHeld(CBETH_ADDRESS));
+
+        // @review donate, the idea is to make EigenLayer shares worth more
+        uint256 donate = 10_000 * 1e18;
+        address tapir = address(69);
+        MockERC20(CBETH_ADDRESS).mint(tapir, donate);
+        console.log("before rate", reLST.assetRegistry.convertFromSharesToAsset(address(cbETHStrategy), 1e18));
+
+        // @review expecting the rate to be higher after donation
+        vm.prank(tapir);
+        MockERC20(CBETH_ADDRESS).transfer(address(cbETHStrategy), donate);
+        console.log("after rate", reLST.assetRegistry.convertFromSharesToAsset(address(cbETHStrategy), 1e18));
+
+        // @review rebalance, expect revert
+        skip(reLST.coordinator.rebalanceDelay());
+        vm.startPrank(EOA, EOA);
+        vm.expectRevert(bytes4(keccak256("INCORRECT_NUMBER_OF_SHARES_QUEUED()")));
+        reLST.coordinator.rebalance(CBETH_ADDRESS);
+        vm.stopPrank();
+    }
+```
+## Impact
+High since the further and current withdrawals are not possible. 
+## Code Snippet
+https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTCoordinator.sol#L99-L151
+
+https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/utils/OperatorOperations.sol#L113-L134
+## Tool used
+
+Manual Review
+
+## Recommendation
+
+
+
+## Discussion
+
+**solimander**
+
+Seems unlikely to have a meaningful effect while rebasing tokens are not supported.
+
+**sherlock-admin4**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/rio-org/rio-sherlock-audit/pull/13
+
+
+**Czar102**
+
+For a more severe impact, see #112.
+
+# Issue H-7: `reportOutOfOrderValidatorExits` does not updates the heap order 
 
 Source: https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/131 
 
@@ -769,1512 +898,15 @@ Manual Review
 ## Recommendation
 update the utilization in the reportOutOfOrderValidatorExits function 
 
-# Issue M-1: Deposits to EigenLayer strategy from deposit pool can revert due to `maxPerDeposit` cap in the EigenLayer strategies 
-
-Source: https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/5 
-
-## Found by 
-g, hash, mstpr-brainbot
-## Summary
-The collected LSTs in the deposit pool are deposited to EigenLayer when a rebalance occurs. Rio contracts only check the total cap, but they don't verify the `maxPerDeposit` in the strategy contracts of EigenLayer. If the deposit exceeds the `maxPerDeposit` set in the strategy contract, the rebalancing will revert.
-## Vulnerability Detail
-Best to demonstrate this with an example, so let's proceed:
-
-Suppose there is only one operator with one strategy in the Rio network, which is the stETH strategy. Users deposit a total of 500 stETH to the contract, which is directly sent to the deposit pool, as evident in the following snippet from the coordinator contract:
-
-```solidity
-function deposit(address asset, uint256 amountIn) external checkDeposit(asset, amountIn) returns (uint256 amountOut) {
-        // Convert deposited asset amount to restaking tokens.
-        amountOut = convertFromAssetToRestakingTokens(asset, amountIn);
-
-        // Pull tokens from the sender to the deposit pool.
-        // @review sends directly to depositPool which the funds are stay idle till the rebalancing happens
-        -> IERC20(asset).safeTransferFrom(msg.sender, address(depositPool()), amountIn);
-
-        // Mint restaking tokens to the caller.
-        token.mint(msg.sender, amountOut);
-
-        emit Deposited(msg.sender, asset, amountIn, amountOut);
-    }
-```
-When the rebalance is called in the coordinator, it triggers the deposit pool to deposit its balance to the EigenLayer. For the sake of this example, let's assume there are no withdrawals queued in the epoch. The following snippet will be called in the deposit pool:
-```solidity
-function depositBalanceIntoEigenLayer(address asset) external onlyCoordinator returns (uint256, bool) {
-        .
-        .
-        address strategy = assetRegistry().getAssetStrategy(asset);
-        uint256 sharesToAllocate = assetRegistry().convertToSharesFromAsset(asset, amountToDeposit);
-        -> return (OperatorOperations.depositTokenToOperators(operatorRegistry(), asset, strategy, sharesToAllocate), isDepositCapped);
-    }
-```
-
-As seen in the above snippet, the `OperatorOperations` library contract is called to deposit the stETH to operators (assuming there is only one in this example). Since there is only one operator, all the shares will be allocated to the stETH strategy, and the `stakeERC20` function will be called in the `OperatorOperations`, which does the following:
-
-```solidity
-function stakeERC20(address strategy, address token_, uint256 amount) external onlyDepositPool returns (uint256 shares) {
-        if (IERC20(token_).allowance(address(this), address(strategyManager)) < amount) {
-            IERC20(token_).forceApprove(address(strategyManager), type(uint256).max);
-        }
-        // @review deposits all the tokens to strategy
-        -> shares = strategyManager.depositIntoStrategy(strategy, token_, amount);
-    }
-```
-
-As observed above, all the funds are directly sent to the strategy for deposit. Inside the strategy manager contract from EigenLayer, there is a `_beforeDeposit` hook that checks the deposit amount and performs some validations:
-
-
-```solidity
-function _beforeDeposit(IERC20 token, uint256 amount) internal virtual override {
-        require(amount <= maxPerDeposit, "StrategyBaseTVLLimits: max per deposit exceeded");
-        require(_tokenBalance() <= maxTotalDeposits, "StrategyBaseTVLLimits: max deposits exceeded");
-
-        super._beforeDeposit(token, amount);
-    }
-```
-
-As seen, the deposited amount is checked to see whether it exceeds the `maxPerDeposit` allowed or not, which is not related to the total cap. In our example, if we were depositing 500 stETH and the `maxPerDeposit` is less than 500 stETH, the call will revert, making rebalancing impossible.
-
-## Impact
-Rebalance would revert. However, the owner can set the operators cap to maxPerDeposit and call rebalance quickly and then sets the cap back to normal. However, this would only solve the issue temporarily and can be frontrunned. I am not sure how to label this, will go for medium.
-## Code Snippet
-https://github.com/sherlock-audit/2024-02-rio-vesting-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTCoordinator.sol#L77-L88
-
-https://github.com/sherlock-audit/2024-02-rio-vesting-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTCoordinator.sol#L121-L151
-
-https://github.com/sherlock-audit/2024-02-rio-vesting-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTDepositPool.sol#L47-L67
-
-https://github.com/sherlock-audit/2024-02-rio-vesting-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/utils/OperatorOperations.sol#L51-L68
-
-https://github.com/sherlock-audit/2024-02-rio-vesting-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTOperatorRegistry.sol#L342-L392
-
-https://github.com/sherlock-audit/2024-02-rio-vesting-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTOperatorDelegator.sol#L174-L179
-
-https://github.com/Layr-Labs/eigenlayer-contracts/blob/5c192e1a780c22e027f6861f958db90fb9ae263c/src/contracts/core/StrategyManager.sol#L323-L342
-
-https://github.com/Layr-Labs/eigenlayer-contracts/blob/5c192e1a780c22e027f6861f958db90fb9ae263c/src/contracts/core/StrategyManager.sol#L105-L111
-
-https://github.com/Layr-Labs/eigenlayer-contracts/blob/5c192e1a780c22e027f6861f958db90fb9ae263c/src/contracts/strategies/StrategyBaseTVLLimits.sol#L79-L84
-## Tool used
-
-Manual `Review`
-
-## Recommendation
-Check the `maxPerDeposit` in the strategy contract and cap the deposits to EigenLayer to that amount
-
-
-
-## Discussion
-
-**solimander**
-
-Originally, we didn't want to add the gas overhead as we may not deploy ERC20 strategies until caps are removed, but I'm considering this one. Feels like it may be worth adding regardless.
-
-# Issue M-2: Depositing to EigenLayer can revert due to round downs in converting shares<->assets 
-
-Source: https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/9 
-
-## Found by 
-0xkaden, Bauer, Drynooo, KupiaSec, Tricko, hash, kennedy1030, klaus, lemonmon, mstpr-brainbot, shaka
-## Summary
-When the underlying tokens deposited from depositPool to EigenLayer strategy, there are bunch of converting operations done which rounds down the solution at some point and the require check reverts hence, the depositing might not be possible due to this small round down issue. 
-## Vulnerability Detail
-Best to go for this is an example, so let's do it.
-
-Assume the deposit pool has 111 * 1e18 stETH waiting for rebalance to be deposited to EigenLayer and there is only 1 operator with 1 strategy allowed which is the EigenLayers stETH strategy. 
-Also, assume the EigenLayer has 3333 * 1e18 stETH in total and 3232  * 1e18 shares in supply. Also, note that the EigenLayer uses virtual shares offset which is 1e3.
-
-Now, let's say there is no withdrawal queue to ease the complexity of the issue and rebalance is called and the balance in the deposit pool will be forwarded to EigenLayer strategy as follows:
-```solidity
-function rebalance(address asset) external checkRebalanceDelayMet(asset) {
-        .
-        .
-        // Deposit remaining assets into EigenLayer.
-        (uint256 sharesReceived, bool isDepositCapped) = depositPool().depositBalanceIntoEigenLayer(asset);
-        .
-    }
-```
-
-Then, the `depositBalanceIntoEigenLayer` will trigger the `OperatorOperations.depositTokenToOperators` function as follows:
-```solidity 
-function depositBalanceIntoEigenLayer(address asset) external onlyCoordinator returns (uint256, bool) {
-        uint256 amountToDeposit = asset.getSelfBalance();
-        if (amountToDeposit == 0) return (0, false);
-        .
-        .
-        address strategy = assetRegistry().getAssetStrategy(asset);
-        uint256 sharesToAllocate = assetRegistry().convertToSharesFromAsset(asset, amountToDeposit);
-        // @review library called
-        -> return (OperatorOperations.depositTokenToOperators(operatorRegistry(), asset, strategy, sharesToAllocate), isDepositCapped);
-    }
-```
-As we can see in the above snippet, the underlying tokens to be deposited which is 111 * 1e18 stETH in our example will be converted to EigenLayer strategy shares via `assetRegistry().convertToSharesFromAsset`
-
-Now, how does EigenLayer calculates how much shares to be minted given an underlying token deposit is as follows:
-```solidity
-function underlyingToSharesView(uint256 amountUnderlying) public view virtual returns (uint256) {
-        // account for virtual shares and balance
-        uint256 virtualTotalShares = totalShares + SHARES_OFFSET;
-        uint256 virtualTokenBalance = _tokenBalance() + BALANCE_OFFSET;
-        // calculate ratio based on virtual shares and balance, being careful to multiply before dividing
-        return (amountUnderlying * virtualTotalShares) / virtualTokenBalance;
-    }
-```
-
-Now, let's plugin our numbers in the example to calculate how much shares would be minted according to EigenLayer:
-`virtualTotalShares` = 3232 * 1e18 + 1e3
-`virtualTokenBalance` = 3333 * 1e18 + 1e3
-`amountUnderlying` = 111 * 1e18
-
-**and when we do the math we will calculate the shares to be minted as:
-107636363636363636364**
-
-Then, the library function will be executed as follows:
-```solidity
-function depositTokenToOperators(
-        IRioLRTOperatorRegistry operatorRegistry,
-        address token,
-        address strategy,
-        uint256 sharesToAllocate // @review 107636363636363636364 as we calculated above!
-    ) internal returns (uint256 sharesReceived) {
-        (uint256 sharesAllocated, IRioLRTOperatorRegistry.OperatorStrategyAllocation[] memory  allocations) = operatorRegistry.allocateStrategyShares(
-            strategy, sharesToAllocate
-        );
-
-        for (uint256 i = 0; i < allocations.length; ++i) {
-            IRioLRTOperatorRegistry.OperatorStrategyAllocation memory allocation = allocations[i];
-
-            IERC20(token).safeTransfer(allocation.delegator, allocation.tokens);
-            sharesReceived += IRioLRTOperatorDelegator(allocation.delegator).stakeERC20(strategy, token, allocation.tokens);
-        }
-        if (sharesReceived != sharesAllocated) revert INCORRECT_NUMBER_OF_SHARES_RECEIVED();
-    }
-```
-
-The very first line of the above snippet executes the `operatorRegistry.allocateStrategyShares`, let's examine that:
-```solidity
- function allocateStrategyShares(address strategy, uint256 sharesToAllocate) external onlyDepositPool returns (uint256 sharesAllocated, OperatorStrategyAllocation[] memory allocations) {
-        .
-        uint256 remainingShares = sharesToAllocate;
-        allocations = new OperatorStrategyAllocation[](s.activeOperatorCount);
-        while (remainingShares > 0) {
-            .
-            .
-            uint256 newShareAllocation = FixedPointMathLib.min(operatorShares.cap - operatorShares.allocation, remainingShares);
-            uint256 newTokenAllocation = IStrategy(strategy).sharesToUnderlyingView(newShareAllocation);
-            allocations[allocationIndex] = OperatorStrategyAllocation(
-                operator.delegator,
-                newShareAllocation,
-                newTokenAllocation
-            );
-            remainingShares -= newShareAllocation;
-            .
-            .
-        }
-        sharesAllocated = sharesToAllocate - remainingShares;
-        .
-        .
-    }
-```
-
-So, let's value the above snippet aswell considering the cap is not reached. As we can see the how much underlying token needed is again calculated by querying the EigenLayer strategy `sharesToUnderlyingView`, so let's first calculate that:
-```solidity
-function sharesToUnderlyingView(uint256 amountShares) public view virtual override returns (uint256) {
-        // account for virtual shares and balance
-        uint256 virtualTotalShares = totalShares + SHARES_OFFSET;
-        uint256 virtualTokenBalance = _tokenBalance() + BALANCE_OFFSET;
-        // calculate ratio based on virtual shares and balance, being careful to multiply before dividing
-        return (virtualTokenBalance * amountShares) / virtualTotalShares;
-    }
-```
-Let's put the values to above snippet:
-`virtualTotalShares` = 3232 * 1e18 + 1e3
-`virtualTokenBalance` = 3333 * 1e18 + 1e3
-`amountShares` = 107636363636363636364
-**hence, the return value is 110999999999999999999(as you noticed it is not 111 * 1e18 as we expect!)**
-
-`sharesToAllocate` =  remainingShares  = newShareAllocation  = 107636363636363636364
-`newTokenAllocation` = 110999999999999999999
-`sharesAllocated` = 107636363636363636364
-
-Now, let's go back to `depositTokenToOperators` function and move with the execution flow:
-
-as we can see the underlying tokens we calculated (110999999999999999999) is deposited to EigenLayer for shares here and then compared in the last line in the if check as follows:
-```solidity
-for (uint256 i = 0; i < allocations.length; ++i) {
-            IRioLRTOperatorRegistry.OperatorStrategyAllocation memory allocation = allocations[i];
-
-            IERC20(token).safeTransfer(allocation.delegator, allocation.tokens);
-            sharesReceived += IRioLRTOperatorDelegator(allocation.delegator).stakeERC20(strategy, token, allocation.tokens);
-        }
-        if (sharesReceived != sharesAllocated) revert INCORRECT_NUMBER_OF_SHARES_RECEIVED();
-```
-
-`stakeERC20` will stake 110999999999999999999 tokens and in exchange **will receive 107636363636363636363** shares. Then the `sharesReceived` will be compared with the **initial share amount calculation which is 107636363636363636364**
-
-**hence, the last if check will revert because
-107636363636363636363 != 107636363636363636364**
-
-**Coded PoC:**
-```solidity
-function test_RioRoundingDownPrecision() external pure returns (uint, uint) {
-        uint underlyingTokens = 111 * 1e18;
-        uint totalUnderlyingTokensInEigenLayer = 3333 * 1e18;
-        uint totalSharesInEigenLayer = 3232 * 1e18;
-        uint SHARE_AND_BALANCE_OFFSET = 1e3;
-
-        uint virtualTotalShares =  totalSharesInEigenLayer + SHARE_AND_BALANCE_OFFSET;
-        uint virtualTokenBalance = totalUnderlyingTokensInEigenLayer + SHARE_AND_BALANCE_OFFSET;
-
-        uint underlyingTokensToEigenLayerShares = (underlyingTokens * virtualTotalShares) / virtualTokenBalance;
-        uint eigenSharesToUnderlying = (virtualTokenBalance * underlyingTokensToEigenLayerShares) / virtualTotalShares;
-
-        // we expect eigenSharesToUnderlying == underlyingTokens, which is not
-        require(eigenSharesToUnderlying != underlyingTokens);
-
-        return (underlyingTokensToEigenLayerShares, eigenSharesToUnderlying);
-    }
-```
-## Impact
-The issue described above can happen frequently as long as the perfect division is not happening when converting shares/assets. In order to solve the issue the amounts and shares has to be perfectly divisible such that the rounding down is not an issue. This can be fixed by owner to airdrop some assets such that this is possible. However, considering how frequent and easy the above scenario can happen and owner needs to do some math to fix the issue, I'll label this as high.
-## Code Snippet
-https://github.com/sherlock-audit/2024-02-rio-vesting-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTDepositPool.sol#L47-L67
-
-https://github.com/sherlock-audit/2024-02-rio-vesting-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTAssetRegistry.sol#L215-L221
-
-https://github.com/Layr-Labs/eigenlayer-contracts/blob/5c192e1a780c22e027f6861f958db90fb9ae263c/src/contracts/strategies/StrategyBase.sol#L211-L243
-
-https://github.com/sherlock-audit/2024-02-rio-vesting-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/utils/OperatorOperations.sol#L51-L68
-
-https://github.com/sherlock-audit/2024-02-rio-vesting-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTOperatorRegistry.sol#L342-L392
-
-https://github.com/sherlock-audit/2024-02-rio-vesting-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTOperatorDelegator.sol#L174-L179
-## Tool used
-
-Manual Review
-
-## Recommendation
-
-# Issue M-3: AssetRegistry owner can be frontrunned when removing asset 
-
-Source: https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/15 
-
-## Found by 
-Avci, HSP, PNS, aslanbek, cats, deth, merlin, mstpr-brainbot, popular
-## Summary
-The AssetRegistry owner can remove an asset at any time, provided that certain checks are satisfied. One of these checks is that the TVL for the asset must be "0". This implies that the asset should not exist in the system at all, neither in the deposit pool nor in the EigenLayer strategy. However, anyone can donate 1 wei of the asset to the deposit pool address to grief the owner, and the owner cannot do anything to prevent it.
-## Vulnerability Detail
-This is the validation checks in the `removeAsset` function implemented:
-
-```solidity
-function removeAsset(address asset) external onlyOwner {
-        if (!isSupportedAsset(asset)) revert ASSET_NOT_SUPPORTED(asset);
-        // @review someone can donate 1 wei to grief here
-        -> if (getTVLForAsset(asset) > 0) revert ASSET_HAS_BALANCE();
-        .
-    }
-```
-
-now let's also check how `getTVLForAsset` function is implemented:
-
-```solidity
-function getTVLForAsset(address asset) public view returns (uint256) {
-        uint256 balance = getTotalBalanceForAsset(asset);
-        if (asset == ETH_ADDRESS) {
-            return balance;
-        }
-        return convertToUnitOfAccountFromAsset(asset, balance);
-    }
-
-function getTotalBalanceForAsset(address asset) public view returns (uint256) {
-        .
-        .
-        -> uint256 tokensInRio = IERC20(asset).balanceOf(depositPool_);
-        uint256 tokensInEigenLayer = convertFromSharesToAsset(getAssetStrategy(asset), sharesHeld);
-
-        return tokensInRio + tokensInEigenLayer;
-    }
-```
-
-as we can observe, `tokensInRio` variable is the `IERC20.balanceOf` call result which means that if anyone donates 1 wei of the asset to deposit pool just before the owners `removeAsset` tx, then the tx will revert.
-
-**Another scenario from same root cause:**
-Since every LRT gets a sacrificial deposit in the deployment phrase, there will be always some excess tokens that are not possible to be burnt because the coordinator can't burn the LRT tokens received in deployment. 
-## Impact
-Very cheap to execute the attack (1 wei of token) and can be called simply even every block to grief owner if really wanted.
-## Code Snippet
-https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTAssetRegistry.sol#L250C5-L263C6
-
-https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTAssetRegistry.sol#L79-L102
-
-## Tool used
-
-Manual Review
-
-## Recommendation
-
-
-
-## Discussion
-
-**nevillehuang**
-
-Borderline medium/low, need @Czar102 opinion, see similar [finding here](https://github.com/sherlock-audit/2023-12-ubiquity-judging/issues/14#issuecomment-1941398707)
-
-**solimander**
-
-Technically valid. May just drop asset removals in this version.
-
-**nevillehuang**
-
-I think this falls under the following category so leaving as medium severity, given users can easily prevent removal of assets
-
-> 1. The issue causes locking of funds for users for more than a week.
-
-# Issue M-4: If the operators receives or tries to deposit dust amount of shares then the rebalance will not be possible 
-
-Source: https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/18 
-
-## Found by 
-almurhasan, fnanni, mstpr-brainbot
-## Summary
-Operators has caps when depositing to the strategies of EigenLayer. If the deposited amount is dust then the round down of the shares minted can be "0" which the tx would revert in EigenLayer side. This would brick the deposit and rebalance flow completely. 
-## Vulnerability Detail
-When the deposit pool has excess balance, the balance will be distributed to operators respecting their utilizations and caps. Assume the least utilized operator has only a few remaining spots left, which is a dust amount like 1e3. Now, let's see what would happen in the allocation flow:
-```solidity
-function allocateStrategyShares(address strategy, uint256 sharesToAllocate) external onlyDepositPool returns (uint256 sharesAllocated, OperatorStrategyAllocation[] memory allocations) {
-        .
-        while (remainingShares > 0) {
-            .
-            .
-           -> uint256 newShareAllocation = FixedPointMathLib.min(operatorShares.cap - operatorShares.allocation, remainingShares);
-            -> uint256 newTokenAllocation = IStrategy(strategy).sharesToUnderlyingView(newShareAllocation);
-            allocations[allocationIndex] = OperatorStrategyAllocation(
-                operator.delegator,
-                newShareAllocation,
-                newTokenAllocation
-            );
-            .
-            .
-        }
-       .
-    }
-```
-
-As we can observe in the above snippet, if the amount is dust, then `uint256 newTokenAllocation = IStrategy(strategy).sharesToUnderlyingView(newShareAllocation);` can be rounded down to "0" since EigenLayer rounds down when calculating the underlying tokens needed. Then, the `newTokenAllocation` will be equal to "0", and the delegation operator deposits the amount to EigenLayer as follows:
-
-```solidity
-function stakeERC20(address strategy, address token_, uint256 amount) external onlyDepositPool returns (uint256 shares) {
-        if (IERC20(token_).allowance(address(this), address(strategyManager)) < amount) {
-            IERC20(token_).forceApprove(address(strategyManager), type(uint256).max);
-        }
-        -> shares = strategyManager.depositIntoStrategy(strategy, token_, amount);
-    }
-```
-
-From the above snippet, we can see that the `strategyManager.depositIntoStrategy` will be called with an amount of "0". Now, let's examine how EigenLayer handles the "0" amount deposits:
-
-```solidity
-function deposit(
-        IERC20 token,
-        uint256 amount
-    ) external virtual override onlyWhenNotPaused(PAUSED_DEPOSITS) onlyStrategyManager returns (uint256 newShares) {
-        .
-        .
-        // account for virtual shares and balance
-        uint256 virtualShareAmount = priorTotalShares + SHARES_OFFSET;
-        uint256 virtualTokenBalance = _tokenBalance() + BALANCE_OFFSET;
-        // calculate the prior virtual balance to account for the tokens that were already transferred to this contract
-        uint256 virtualPriorTokenBalance = virtualTokenBalance - amount;
-        newShares = (amount * virtualShareAmount) / virtualPriorTokenBalance;
-
-        // extra check for correctness / against edge case where share rate can be massively inflated as a 'griefing' sort of attack
-        -> require(newShares != 0, "StrategyBase.deposit: newShares cannot be zero");
-        .
-    }
-```
-
-As we can see, if the shares to be minted are "0," which will be the case since we try to deposit "0" amount of tokens, then the transaction will revert, hence, the entire deposit flow will be halted.
-
-Malicious Scenario:
-Assume that at an epoch, there are "N" assets requested for withdrawal, and there are no deposits to the LRT token. The attacker can donate 1 wei to the deposit pool just before the rebalance call. Subsequently, the rebalance would attempt to withdraw the "N" tokens as normal. However, when it tries to deposit the excess back to operators, which is only "1 wei," the transaction can revert since it's a dust amount.
-## Impact
-The above scenarios can happen in normal flow or can be triggered by a malicious user. There is a DoS threat and it needs donations or owner manually lowering the caps. Hence, I will label this as medium.
-## Code Snippet
-https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTOperatorRegistry.sol#L342-L392
-
-https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTOperatorDelegator.sol#L174-L179
-
-https://github.com/Layr-Labs/eigenlayer-contracts/blob/5c192e1a780c22e027f6861f958db90fb9ae263c/src/contracts/strategies/StrategyBase.sol#L96-L123
-## Tool used
-
-Manual Review
-
-## Recommendation
-If the amount is dust then skip to the next operator and ignore the amount, don't deposit. 
-
-
-
-## Discussion
-
-**nevillehuang**
-
-request poc
-
-Given there is a sacrificial deposit, wouldn't this be not possible?
-
-**sherlock-admin3**
-
-PoC requested from @mstpr
-
-Requests remaining: **18**
-
-**mstpr**
-
-
-PoC:
-```solidity
-// forge test --match-contract RioLRTDepositPoolTest --match-test test_RoundDownInEigenLayerStrategy -vv
- function test_RoundDownInEigenLayerStrategy() public {
-        uint8 operatorId = addOperatorDelegator(reLST.operatorRegistry, address(reLST.rewardDistributor));
-        address operatorDelegator = reLST.operatorRegistry.getOperatorDetails(operatorId).delegator;
-
-        // initiate the strategy with some funds first
-        uint bootstrapAm = 100 * 1e18;
-        cbETH.mint(EOA, bootstrapAm);
-        uint256 AMOUNT = 1;
-        vm.prank(EOA);
-        cbETH.approve(address(strategyManager), type(uint256).max);
-        vm.prank(EOA);
-        strategyManager.depositIntoStrategy(address(CBETH_STRATEGY), CBETH_ADDRESS, bootstrapAm);
-        // add some more cbETH to mock yield on the strategy
-        cbETH.mint(address(CBETH_STRATEGY), 1e5);
-
-        uint sharess = IStrategy(CBETH_STRATEGY).underlyingToSharesView(AMOUNT);
-        // round down to "0" as we expected!
-        assertEq(sharess, 0);
-
-        // Allocate to cbETH strategy.small amount such that the amount round down in EigenLayer strategy and it reverts
-        cbETH.approve(address(reLST.coordinator), type(uint256).max);
-        reLST.coordinator.deposit(CBETH_ADDRESS, AMOUNT);
-        console.log("SHARES HELD", reLST.assetRegistry.getAssetSharesHeld(CBETH_ADDRESS));
-
-        // Push funds into EigenLayer, it will fail because of the 
-        vm.startPrank(EOA, EOA);
-        vm.expectRevert();
-        reLST.coordinator.rebalance(CBETH_ADDRESS);
-        vm.stopPrank();
-    }
-```
-
-**mstpr**
-
-> request poc
-> 
-> Given there is a sacrificial deposit, wouldn't this be not possible?
-
-
-
-> request poc
-> 
-> Given there is a sacrificial deposit, wouldn't this be not possible?
-
-Not really. This round down issue happens in EigenLayer strategy side not in Rio's. 
-
-**solimander**
-
-I don't believe this is feasible when there are actually pending withdrawals.
-
-e.g.
-
-```solidity
-function test_RoundDownInEigenLayerStrategy() public {
-    uint8 operatorId = addOperatorDelegator(reLST.operatorRegistry, address(reLST.rewardDistributor));
-    address operatorDelegator = reLST.operatorRegistry.getOperatorDetails(operatorId).delegator;
-
-    // initiate the strategy with some funds first
-    uint256 bootstrapAm = 100 * 1e18;
-    cbETH.mint(EOA, bootstrapAm);
-    uint256 AMOUNT = 1;
-    vm.prank(EOA);
-    cbETH.approve(address(strategyManager), type(uint256).max);
-    vm.prank(EOA);
-
-    strategyManager.depositIntoStrategy(address(CBETH_STRATEGY), CBETH_ADDRESS, bootstrapAm);
-
-    cbETH.approve(address(reLST.coordinator), type(uint256).max);
-
-    // Deposit to create some reLST to withdraw
-    cbETH.mint(address(CBETH_STRATEGY), 1e18);
-    uint256 amountOut = reLST.coordinator.deposit(CBETH_ADDRESS, 1e18);
-
-    // Rebalance to push into EigenLayer
-    skip(reLST.coordinator.rebalanceDelay());
-
-    vm.prank(EOA, EOA);
-    reLST.coordinator.rebalance(CBETH_ADDRESS);
-
-    reLST.coordinator.requestWithdrawal(CBETH_ADDRESS, amountOut);
-
-    // add some more cbETH to mock yield on the strategy
-    cbETH.mint(address(CBETH_STRATEGY), 1e5);
-
-    uint256 sharess = IStrategy(CBETH_STRATEGY).underlyingToSharesView(AMOUNT);
-    // round down to "0" as we expected!
-    assertEq(sharess, 0);
-
-    // Allocate to cbETH strategy.small amount such that the amount round down in EigenLayer strategy and it reverts
-    reLST.coordinator.deposit(CBETH_ADDRESS, AMOUNT);
-    console.log('SHARES HELD', reLST.assetRegistry.getAssetSharesHeld(CBETH_ADDRESS));
-
-    skip(reLST.coordinator.rebalanceDelay());
-
-    vm.startPrank(EOA, EOA);
-    vm.expectRevert();
-    reLST.coordinator.rebalance(CBETH_ADDRESS);
-    vm.stopPrank();
-}
-```
-
-# Issue M-5: Ether can stuck when an operators validators are removed due to an user front-running 
-
-Source: https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/45 
-
-## Found by 
-hash, mstpr-brainbot, zzykxx
-## Summary
-When a full withdrawal occurs in the EigenPod, the excess amount can remain idle within the EigenPod and can only be swept by calling a function in the delegator contract of a specific operator. However, in cases where the owner removes all validators for emergencies or any other reason, a user can frontrun the transaction, willingly or not, causing the excess ETH to become stuck in the EigenPod. The only way to recover the ether would be for the owner to reactivate the validators, which may not be intended since the owner initially wanted to remove all the validators and now needs to add them again.
-## Vulnerability Detail
-Let's assume a Layered Relay Token (LRT) with a beacon chain strategy and only two operators for simplicity. Each operator is assigned two validators, allowing each operator to stake 64 ETH in the PoS staking via the EigenPod.
-
-At any time, the EigenPod owner can update the effective balance of the validators' PoS staking by calling this function:
-https://github.com/Layr-Labs/eigenlayer-contracts/blob/6de01c6c16d6df44af15f0b06809dc160eac0ebf/src/contracts/pods/EigenPod.sol#L294-L345
-This function can be triggered by the owner of the operator registry or proof uploader by invoking this function:
-https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTOperatorRegistry.sol#L236-L253
-
-Now, let's consider a scenario where the effective verified balance of the most utilized operator is 64 ETH, and the operator's validators need to be shut down. In such a case, the operator registry admin can call this function to withdraw the entire ETH balance from the operator's delegator:
-https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTOperatorRegistry.sol#L163-L165
-
-This function triggers a full withdrawal from the operator's delegator EigenPod. The `queueOperatorStrategyExit` function will withdraw the entire validator balance as follows:
-```solidity
-if (validatorDetails.cap > 0 && newValidatorCap == 0) {
-            // If there are active deposits, queue the operator for strategy exit.
-            if (activeDeposits > 0) {
-                -> operatorDetails.queueOperatorStrategyExit(operatorId, BEACON_CHAIN_STRATEGY);
-                .
-            }
-           .
-        } else if (validatorDetails.cap == 0 && newValidatorCap > 0) {
-           .
-        } else {
-           .
-        }
-```
-
-`operatorDetails.queueOperatorStrategyExit` function will full withdraw the entire validator balance as follows:
-
-```solidity
-function queueOperatorStrategyExit(IRioLRTOperatorRegistry.OperatorDetails storage operator, uint8 operatorId, address strategy) internal {
-        IRioLRTOperatorDelegator delegator = IRioLRTOperatorDelegator(operator.delegator);
-
-        uint256 sharesToExit;
-        if (strategy == BEACON_CHAIN_STRATEGY) {
-            // Queues an exit for verified validators only. Unverified validators must by exited once verified,
-            // and ETH must be scraped into the deposit pool. Exits are rounded to the nearest Gwei. It is not
-            // possible to exit ETH with precision less than 1 Gwei. We do not populate `sharesToExit` if the
-            // Eigen Pod shares are not greater than 0.
-            int256 eigenPodShares = delegator.getEigenPodShares();
-            if (eigenPodShares > 0) {
-                sharesToExit = uint256(eigenPodShares).reducePrecisionToGwei();
-            }
-        } else {
-            .
-        }
-        .
-    }
-```
-As observed, the entire EigenPod shares are requested as a withdrawal, which is 64 Ether. However, a user can request a 63 Ether withdrawal before the owner's transaction from the coordinator, which would also trigger a full withdrawal of 64 Ether. In the end, the user would receive 63 Ether, leaving 1 Ether idle in the EigenPod:
- 
-```solidity
-function queueETHWithdrawalFromOperatorsForUserSettlement(IRioLRTOperatorRegistry operatorRegistry, uint256 amount) internal returns (bytes32 aggregateRoot) {
-        .
-        for (uint256 i = 0; i < length; ++i) {
-            address delegator = operatorDepositDeallocations[i].delegator;
-
-            -> // Ensure we do not send more than needed to the withdrawal queue. The remaining will stay in the Eigen Pod.
-            uint256 amountToWithdraw = (i == length - 1) ? remainingAmount : operatorDepositDeallocations[i].deposits * ETH_DEPOSIT_SIZE;
-
-            remainingAmount -= amountToWithdraw;
-            roots[i] = IRioLRTOperatorDelegator(delegator).queueWithdrawalForUserSettlement(BEACON_CHAIN_STRATEGY, amountToWithdraw);
-        }
-        .
-    }
-```
-
-In such a scenario, the queued amount would be 63 Ether, and 1 Ether would remain idle in the EigenPod. Since the owner's intention was to shut down the validators in the operator for good, that 1 Ether needs to be scraped as well. However, the owner is unable to sweep it due to `MIN_EXCESS_FULL_WITHDRAWAL_ETH_FOR_SCRAPE`:
-```solidity
-function scrapeExcessFullWithdrawalETHFromEigenPod() external {
-        // @review this is 1 ether
-        uint256 ethWithdrawable = eigenPod.withdrawableRestakedExecutionLayerGwei().toWei();
-        // @review this is also 1 ether
-        -> uint256 ethQueuedForWithdrawal = getETHQueuedForWithdrawal();
-        if (ethWithdrawable <= ethQueuedForWithdrawal + MIN_EXCESS_FULL_WITHDRAWAL_ETH_FOR_SCRAPE) {
-            revert INSUFFICIENT_EXCESS_FULL_WITHDRAWAL_ETH();
-        }
-        _queueWithdrawalForOperatorExitOrScrape(BEACON_CHAIN_STRATEGY, ethWithdrawable - ethQueuedForWithdrawal);
-    }
-```
-
-Which means that owner has to set the validator caps for the operator again to recover that 1 ether which might not be possible since the owner decided to shutdown the entire validators for the specific operator. 
-
-**Another scenario from same root cause:**
-1- There are 64 ether in an operator 
-2- Someone requests a withdrawal of 50 ether
-3- All 64 ether is withdrawn from beacon chain 
-4- 50 ether sent to the users withdrawal, 14 ether is idle in the EigenPod waiting for someone to call `scrapeExcessFullWithdrawalETHFromEigenPod`
-5- An user quickly withdraws 13 ether
-6- `withdrawableRestakedExecutionLayerGwei` is 1 ether and `INSUFFICIENT_EXCESS_FULL_WITHDRAWAL_ETH` also 1 ether. Which means the 1 ether can't be re-added to deposit pool until someone withdraws.
-
-**Coded PoC:**
-```solidity
-// forge test --match-contract RioLRTOperatorDelegatorTest --match-test test_StakeETHCalledWith0Ether -vv
-    function test_StuckEther() public {
-        uint8 operatorId = addOperatorDelegator(reETH.operatorRegistry, address(reETH.rewardDistributor));
-        address operatorDelegator = reETH.operatorRegistry.getOperatorDetails(operatorId).delegator;
-
-        uint256 TVL = 64 ether;
-        uint256 WITHDRAWAL_AMOUNT = 63 ether;
-        RioLRTOperatorDelegator delegatorContract = RioLRTOperatorDelegator(payable(operatorDelegator));
-
-        // Allocate ETH.
-        reETH.coordinator.depositETH{value: TVL - address(reETH.depositPool).balance}();
-
-
-        // Push funds into EigenLayer.
-        vm.prank(EOA, EOA);
-        reETH.coordinator.rebalance(ETH_ADDRESS);
-
-
-        // Verify validator withdrawal credentials.
-        uint40[] memory validatorIndices = verifyCredentialsForValidators(reETH.operatorRegistry, operatorId, 2);
-
-
-        // Verify and process two full validator exits.
-        verifyAndProcessWithdrawalsForValidatorIndexes(operatorDelegator, validatorIndices);
-
-        // Withdraw some funds.
-        reETH.coordinator.requestWithdrawal(ETH_ADDRESS, WITHDRAWAL_AMOUNT);
-        uint256 withdrawalEpoch = reETH.withdrawalQueue.getCurrentEpoch(ETH_ADDRESS);
-
-        // Skip ahead and rebalance to queue the withdrawal within EigenLayer.
-        skip(reETH.coordinator.rebalanceDelay());
-
-        vm.prank(EOA, EOA);
-        reETH.coordinator.rebalance(ETH_ADDRESS);
-
-        // Verify and process two full validator exits.
-        verifyAndProcessWithdrawalsForValidatorIndexes(operatorDelegator, validatorIndices);
-
-        // Settle with withdrawal epoch.
-        IDelegationManager.Withdrawal[] memory withdrawals = new IDelegationManager.Withdrawal[](1);
-        withdrawals[0] = IDelegationManager.Withdrawal({
-            staker: operatorDelegator,
-            delegatedTo: address(1),
-            withdrawer: address(reETH.withdrawalQueue),
-            nonce: 0,
-            startBlock: 1,
-            strategies: BEACON_CHAIN_STRATEGY.toArray(),
-            shares: WITHDRAWAL_AMOUNT.toArray()
-        });
-        reETH.withdrawalQueue.settleEpochFromEigenLayer(ETH_ADDRESS, withdrawalEpoch, withdrawals, new uint256[](1));
-
-        vm.expectRevert(bytes4(keccak256("INSUFFICIENT_EXCESS_FULL_WITHDRAWAL_ETH()")));
-        delegatorContract.scrapeExcessFullWithdrawalETHFromEigenPod();
-    }
-```
-
-## Impact
-Owner needs to set the caps again to recover the 1 ether. However, the validators are removed for a reason and adding operators again would probably be not intended since it was a shutdown. Hence, I'll label this as medium.
-## Code Snippet
-https://github.com/Layr-Labs/eigenlayer-contracts/blob/6de01c6c16d6df44af15f0b06809dc160eac0ebf/src/contracts/pods/EigenPod.sol#L294-L345
-
-https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTOperatorRegistry.sol#L236-L253
-
-https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/utils/OperatorRegistryV1Admin.sol#L276-L319
-
-https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTOperatorDelegator.sol#L225-L227
-
-https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/utils/OperatorRegistryV1Admin.sol#L144-L165
-
-https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTOperatorDelegator.sol#L253-L273
-
-https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTCoordinator.sol#L99-L116
-
-https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/utils/OperatorOperations.sol#L88-L107
-
-https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTOperatorDelegator.sol#L160-L167
-## Tool used
-
-Manual Review
-
-## Recommendation
-Make an emergency function which owner can scrape the excess eth regardless of `MIN_EXCESS_FULL_WITHDRAWAL_ETH_FOR_SCRAPE`
-
-
-
-## Discussion
-
-**nevillehuang**
-
-Borderline Medium/Low, leaving open for discussion. I think I agree with watsons, unless there is someway to retrieve the potentially locked ETH.
-
-**solimander**
-
-Accepted risk of design, though considering adding an emergency scrape function to avoid the possible annoyance.
-
-**nevillehuang**
-
-I believe this risk should have been mentioned in contest details, so leaving as medium severity.
-
-# Issue M-6: A part of ETH rewards can be stolen by sandwiching `claimDelayedWithdrawals()` 
-
-Source: https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/52 
-
-## Found by 
-araj, aslanbek, cats, giraffe, pontifex, zzykxx
-## Summary
-Rewards can be stolen by sandwiching the call to [EigenLayer::DelayedWithdrawalRouter::claimDelayedWithdrawals()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/DelayedWithdrawalRouter.sol#L99).
-
-## Vulnerability Detail
-The protocol handles ETH rewards by sending them to the [rewards distributor](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/restaking/RioLRTRewardDistributor.sol). There are at least 3 flows that end-up sending funds there:
-1. When the function [RioLRTOperatorDelegator::scrapeNonBeaconChainETHFromEigenPod()](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/restaking/RioLRTOperatorDelegator.sol#L150) is called to scrape non beacon chain ETH from an Eigenpod.
-2. When a validator receives rewards via partial withdrawals after the function [EigenPod::verifyAndProcessWithdrawals()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L232) is called.
-3. When a validator exists and has more than 32ETH the excess will be sent as rewards after the function [EigenPod::verifyAndProcessWithdrawals()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L232) is called.
-
-All of these 3 flows end up queuing a withdrawal to the [rewards distributor](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/restaking/RioLRTRewardDistributor.sol). After a delay the rewards can claimed by calling the permissionless function [EigenLayer::DelayedWithdrawalRouter::claimDelayedWithdrawals()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/DelayedWithdrawalRouter.sol#L99), this call will instantly increase the TVL of the protocol.
-
-An attacker can take advantage of this to steal a part of the rewards:
-1. Mint a sensible amount of `LRTTokens` by depositing an accepted asset
-2. Call [EigenLayer::DelayedWithdrawalRouter::claimDelayedWithdrawals()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/DelayedWithdrawalRouter.sol#L99), after which the value of the `LRTTokens` just minted will immediately increase.
-3. Request a withdrawal for all the `LRTTokens` via [RioLRTCoordinator::requestWithdrawal()](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/restaking/RioLRTCoordinator.sol#L99).
-
-### POC
-Change [RioLRTRewardsDistributor::receive()](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/restaking/RioLRTOperatorDelegator.sol#L244-L246) (to side-step a gas limit bug:
-```solidity
-receive() external payable {
-    (bool success,) = address(rewardDistributor()).call{value: msg.value}('');
-    require(success);
-}
-```
-
-Add the following imports to `RioLRTOperatorDelegator`:
-```solidity
-import {IRioLRTWithdrawalQueue} from 'contracts/interfaces/IRioLRTWithdrawalQueue.sol';
-import {IRioLRTOperatorRegistry} from 'contracts/interfaces/IRioLRTOperatorRegistry.sol';
-import {CredentialsProofs, BeaconWithdrawal} from 'test/utils/beacon-chain/MockBeaconChain.sol';
-```
-To copy-paste in `RioLRTOperatorDelegator.t.sol`:
-
-```solidity
-function test_stealRewards() public {
-    address alice = makeAddr("alice");
-    address bob = makeAddr("bob");
-    uint256 aliceInitialBalance = 40e18;
-    uint256 bobInitialBalance = 40e18;
-    deal(alice, aliceInitialBalance);
-    deal(bob, bobInitialBalance);
-    vm.prank(alice);
-    reETH.token.approve(address(reETH.coordinator), type(uint256).max);
-    vm.prank(bob);
-    reETH.token.approve(address(reETH.coordinator), type(uint256).max);
-
-    //->Operator delegator and validators are added to the protocol
-    uint8 operatorId = addOperatorDelegator(reETH.operatorRegistry, address(reETH.rewardDistributor));
-    RioLRTOperatorDelegator operatorDelegator =
-        RioLRTOperatorDelegator(payable(reETH.operatorRegistry.getOperatorDetails(operatorId).delegator));
-
-    //-> Alice deposits ETH in the protocol
-    vm.prank(alice);
-    reETH.coordinator.depositETH{value: aliceInitialBalance}();
-    
-    //-> Rebalance is called and the ETH deposited in a validator
-    vm.prank(EOA, EOA);
-    reETH.coordinator.rebalance(ETH_ADDRESS);
-
-    //-> Create a new validator with a 40ETH balance and verify his credentials.
-    //-> This is to "simulate" rewards accumulation
-    uint40[] memory validatorIndices = new uint40[](1);
-    IRioLRTOperatorRegistry.OperatorPublicDetails memory details = reETH.operatorRegistry.getOperatorDetails(operatorId);
-    bytes32 withdrawalCredentials = operatorDelegator.withdrawalCredentials();
-    beaconChain.setNextTimestamp(block.timestamp);
-    CredentialsProofs memory proofs;
-    (validatorIndices[0], proofs) = beaconChain.newValidator({
-        balanceWei: 40 ether,
-        withdrawalCreds: abi.encodePacked(withdrawalCredentials)
-    });
-    
-    //-> Verify withdrawal crendetials
-    vm.prank(details.manager);
-    reETH.operatorRegistry.verifyWithdrawalCredentials(
-        operatorId,
-        proofs.oracleTimestamp,
-        proofs.stateRootProof,
-        proofs.validatorIndices,
-        proofs.validatorFieldsProofs,
-        proofs.validatorFields
-    );
-
-    //-> A full withdrawal for the validator is processed, 8ETH (40ETH - 32ETH) will be queued as rewards
-    verifyAndProcessWithdrawalsForValidatorIndexes(address(operatorDelegator), validatorIndices);
-
-    //-> Bob, an attacker, does the following:
-    //      1. Deposits 40ETH and receives ~40e18 LRTTokens
-    //      2. Cliam the withdrawal for the validator, which will instantly increase the TVL by ~7.2ETH
-    //      3. Requests a withdrawal with all of the LRTTokens 
-    {
-        //1. Deposits 40ETH and receives ~40e18 LRTTokens
-        vm.startPrank(bob);
-        reETH.coordinator.depositETH{value: bobInitialBalance}();
-
-        //2. Cliam the withdrawal for the validator, which will instantly increase the TVL by ~7.2ETH
-        uint256 TVLBefore = reETH.assetRegistry.getTVL();
-        delayedWithdrawalRouter.claimDelayedWithdrawals(address(operatorDelegator), 1); 
-        uint256 TVLAfter = reETH.assetRegistry.getTVL();
-
-        //->TVL increased by 7.2ETH
-        assertEq(TVLAfter - TVLBefore, 7.2e18);
-
-        //3. Requests a withdrawal with all of the LRTTokens 
-        reETH.coordinator.requestWithdrawal(ETH_ADDRESS, reETH.token.balanceOf(bob));
-        vm.stopPrank();
-    }
-    
-    //-> Wait and rebalance
-    skip(reETH.coordinator.rebalanceDelay());
-    vm.prank(EOA, EOA);
-    reETH.coordinator.rebalance(ETH_ADDRESS);
-
-    //-> Bob withdraws the funds he requested
-    vm.prank(bob);
-    reETH.withdrawalQueue.claimWithdrawalsForEpoch(IRioLRTWithdrawalQueue.ClaimRequest({asset: ETH_ADDRESS, epoch: 0}));
-
-    //-> Bob has stole ~50% of the rewards and has 3.59ETH more than he initially started with
-    assertGt(bob.balance, bobInitialBalance);
-    assertEq(bob.balance - bobInitialBalance, 3599550056000000000);
-}
-```
-
-## Impact
-Rewards can be stolen by sandwiching the call to [EigenLayer::DelayedWithdrawalRouter::claimDelayedWithdrawals()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/DelayedWithdrawalRouter.sol#L99), however this requires a bigger investment in funds the higher the protocol TVL.
-
-## Code Snippet
-
-## Tool used
-
-Manual Review
-
-## Recommendation
-When requesting withdrawals via [RioLRTCoordinator::requestWithdrawal()](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/restaking/RioLRTCoordinator.sol#L99) don't distribute the rewards received in the current epoch.
-
-# Issue M-7: Requested withdrawal can be impossible to settle due to EigenLayer shares value appreciate when there are idle funds in deposit pool 
-
-Source: https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/109 
-
-## Found by 
-Audinarey, Aymen0909, Bauer, Bony, Drynooo, cats, deepplus, g, hash, kennedy1030, monrel, mstpr-brainbot, peanuts, sakshamguruji, shaka, zzykxx
-## Summary
-When users request a withdrawal, the EigenLayer shares equivalent to their LRT's value are recorded. During settlement, these EigenLayer shares must be deducted to finalize the withdrawal epoch. However, in certain scenarios, the requested EigenLayer shares may be impossible to unwind due to funds idling in the deposit pool. 
-## Vulnerability Detail
-Let's assume that 1 LRT equals 1 EigenLayer-cbETH, which equals 1 cbETH initially.
-
-Alice deposits 5e18 cbETH, and her deposits are allocated to operators after rebalancing. Now, Rio holds 5 EigenLayer-cbETH, which is worth 5 cbETH.
-
-After some time, Bob deposits 100e18 cbETH to Rio and immediately withdraws it. At the time Bob requests this withdrawal, 100 cbETH is worth 100 EigenLayer-cbETH, so the shares owed are 100 EigenLayer-cbETH. At settlement, 100 EigenLayer-cbETH worth of cbETH has to be sent to the withdrawal queue to settle this epoch.
-
-Now, assume that the value of EigenLayer-cbETH increases, meaning that 1 EigenLayer-cbETH is now worth more cbETH. This is an expected behavior because EigenLayer-cbETH is similar to an ERC4626 vault, and we expect its value to increase over time.
-
-Let's say 1 EigenLayer-cbETH is now worth 1.1 cbETH.
-
-Now, 100 cbETH sits idle in the deposit pool, and there are 5 EigenLayer-cbETH in the operators, which means there are a total of 90.9 + 5 = 95.9 EigenLayer-cbETH worth of cbETH in Rio. However, Bob's withdrawal request is for 100 EigenLayer-cbETH.
-
-This would mean that Bob's withdrawal request will not be settled, and the entire withdrawal flow will be stuck because this epoch can't be settled.
-
-
-
-**Coded PoC:**
-```solidity
- // forge test --match-contract RioLRTDepositPoolTest --match-test test_InsufficientSharesInWithdrawal -vv
-    function test_InsufficientSharesInWithdrawal() public {
-        uint8 operatorId = addOperatorDelegator(reLST.operatorRegistry, address(reLST.rewardDistributor));
-        address operatorDelegator = reLST.operatorRegistry.getOperatorDetails(operatorId).delegator;
-
-        uint256 AMOUNT = 5e18;
-
-        // Allocate to cbETH strategy.
-        cbETH.approve(address(reLST.coordinator), type(uint256).max);
-        reLST.coordinator.deposit(CBETH_ADDRESS, AMOUNT);
-        console.log("SHARES HELD", reLST.assetRegistry.getAssetSharesHeld(CBETH_ADDRESS));
-
-        // Push funds into EigenLayer.
-        vm.prank(EOA, EOA);
-        reLST.coordinator.rebalance(CBETH_ADDRESS);
-
-        assertEq(cbETH.balanceOf(address(reLST.depositPool)), 0);
-        assertEq(reLST.assetRegistry.getAssetSharesHeld(CBETH_ADDRESS), AMOUNT);
-        console.log("SHARES HELD", reLST.assetRegistry.getAssetSharesHeld(CBETH_ADDRESS));
-
-        // @review before rebalance, deposit 100 * 1e18
-        reLST.coordinator.deposit(CBETH_ADDRESS, 100e18);
-
-        // @review request withdrawal 
-        reLST.coordinator.requestWithdrawal(CBETH_ADDRESS, 100e18);
-        console.log("SHARES HELD", reLST.assetRegistry.getAssetSharesHeld(CBETH_ADDRESS));
-
-        // @review donate, the idea is to make EigenLayer shares worth more
-        uint256 donate = 10_000 * 1e18;
-        address tapir = address(69);
-        MockERC20(CBETH_ADDRESS).mint(tapir, donate);
-        console.log("before rate", reLST.assetRegistry.convertFromSharesToAsset(address(cbETHStrategy), 1e18));
-
-        // @review expecting the rate to be higher after donation
-        vm.prank(tapir);
-        MockERC20(CBETH_ADDRESS).transfer(address(cbETHStrategy), donate);
-        console.log("after rate", reLST.assetRegistry.convertFromSharesToAsset(address(cbETHStrategy), 1e18));
-
-        // @review rebalance, expect revert
-        skip(reLST.coordinator.rebalanceDelay());
-        vm.startPrank(EOA, EOA);
-        vm.expectRevert(bytes4(keccak256("INCORRECT_NUMBER_OF_SHARES_QUEUED()")));
-        reLST.coordinator.rebalance(CBETH_ADDRESS);
-        vm.stopPrank();
-    }
-```
-## Impact
-High since the further and current withdrawals are not possible. 
-## Code Snippet
-https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTCoordinator.sol#L99-L151
-
-https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/utils/OperatorOperations.sol#L113-L134
-## Tool used
-
-Manual Review
-
-## Recommendation
-
-
-
-## Discussion
-
-**solimander**
-
-Seems unlikely to have a meaningful effect while rebasing tokens are not supported.
-
-# Issue M-8: Partial withdrawals will decrease the LRT exchange rate 
-
-Source: https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/118 
-
-## Found by 
-mstpr-brainbot
-## Summary
-When the native staking validators are claimed via partial withdrawals from EigenPod the eigen pod shares will decrease whenever someone verifies the beacon chain balance of the validator. The rewards that are previously counted will decrease immediately hence, the exchange rate will change. 
-## Vulnerability Detail
-Assume that an operators validator has 34 ether in its validator where as 32 ether of it is the deposited part and the 2 ether is the reward. Also, the EigenPods balance is verified via [verifyBalanceUpdates](https://github.com/Layr-Labs/eigenlayer-contracts/blob/6de01c6c16d6df44af15f0b06809dc160eac0ebf/src/contracts/pods/EigenPod.sol#L185-L191) hence, the eigen pod shares that the operator has is 34 and its confirmed. 
-
-Assume the validator decides to a partial withdrawal and claims the 2 ether from its beacon chain validator balance via [verifyAndProcessWithdrawals](https://github.com/Layr-Labs/eigenlayer-contracts/blob/6de01c6c16d6df44af15f0b06809dc160eac0ebf/src/contracts/pods/EigenPod.sol#L232-L239)
-
-as we can see in the below snippet of **partial withdrawal**, there will be no shares difference which the EigenPod shares will not be updated after the `verifyAndProcessWithdrawals` call, however, the amount (2 ether in our case) will be sent to delayed router and can be claimed after the delay passes.
-```solidity
-function _processPartialWithdrawal(
-        uint40 validatorIndex,
-        uint64 withdrawalTimestamp,
-        address recipient,
-        uint64 partialWithdrawalAmountGwei
-    ) internal returns (VerifiedWithdrawal memory) {
-        emit PartialWithdrawalRedeemed(
-            validatorIndex,
-            withdrawalTimestamp,
-            recipient,
-            partialWithdrawalAmountGwei
-        );
-
-        sumOfPartialWithdrawalsClaimedGwei += partialWithdrawalAmountGwei;
-
-        // For partial withdrawals, the withdrawal amount is immediately sent to the pod owner
-        return
-            VerifiedWithdrawal({
-                amountToSendGwei: uint256(partialWithdrawalAmountGwei),
-                sharesDeltaGwei: 0
-            });
-    }
-```
-
-```solidity
-if (withdrawalSummary.amountToSendGwei != 0) {
-            _sendETH_AsDelayedWithdrawal(podOwner, withdrawalSummary.amountToSendGwei * GWEI_TO_WEI);
-        }
-```
-
-At this point, if someone calls `verifyBalanceUpdates` since the beacon chain of the validator has 32 ether now and previously it had 34 ether, the 2 ether excess will be decreased. Hence, the pod will have now 32 eigen pod shares. 
-
-That means now the TVL has decreased by 2 ether until the delayed router claims and sends the ether back to the reward distributor contract. Also, note that the reward distributor contract not distributes the entire 2 ether to the deposit pool but some portion, so the recovered TVL will be lesser than 34 ether anyways. 
-
-Conclusively, the ether balance will decrease 2 ether immediately and the exchange rate will be manipulated in this time window. All the functions such as deposit/withdrawals will be accounted mistakenly. 
-
-**`Flow of the above scenario:`**
-1- Operators validator receives 32 ether, and gets confirmed by the `verifyBalanceUpdates`, which EigenPodManager credits 32 shares.
-2- After sometime, someone again calls `verifyBalanceUpdates` this time there are 34 ether due to rewards accrued from pos staking hence, an another 2 eigen pod shares credited, in total there are 34 eigen pod shares.
-3- Validator does a partial withdrawal
-4- Validator claims the 2 ether by partial withdrawal via `verifyAndProcessWithdrawals` this function sends the 2 ether to delayed router which can be claimed by operator delegator contract once the delay has passed. However, this function does not updates the eigen pod shares, which means the TVL is still 34 eigen pod shares
-5- Someone proves the balance via `verifyBalanceUpdates` again and now since the validator has 32 ether, the excess 2 pod shares will be decreased and the TVL is now 32 eigen pod shares! 
-6- The TVL decreased by 2 shares but in reality those 2 shares are the result of 2 ether claimed from rewards and they will be re-added to the contract balance after a delay. Decreasing the TVL here will manipulate the LRT exchange rate mistakenly since the 2 ether is not lost, they are just claimed and will be re-accounted soon.
-
-## Impact
-High, since the rewards will be claimed frequently and every time rewards are claimed the TVL will drop hence the exchange rate will be manipulated mistakenly. 
-## Code Snippet
-https://github.com/Layr-Labs/eigenlayer-contracts/blob/6de01c6c16d6df44af15f0b06809dc160eac0ebf/src/contracts/pods/EigenPod.sol#L185-L277
-## Tool used
-
-Manual Review
-
-## Recommendation
-
-
-
-## Discussion
-
-**nevillehuang**
-
-request poc
-
-**sherlock-admin3**
-
-PoC requested from @mstpr
-
-Requests remaining: **17**
-
-**solimander**
-
-Don't see a large impact here, but will update to account for partial withdrawals earlier.
-
-# Issue M-9: Execution Layer rewards are lost 
-
-Source: https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/174 
-
-## Found by 
-fnanni
-## Summary
-
-According to Rio Network Docs: "The Reward Distributor contract ([RioLRTRewardDistributor](https://github.com/contracts-and-tooling/source-code/restaking/riolrtrewarddistributor)) has the ability to [receive](https://github.com/contracts-and-tooling/source-code/restaking/riolrtrewarddistributor#receive) ETH via the Ethereum Execution Layer or EigenPod rewards and then distribute those rewards". However, this is only true for EigenPod rewards. Execution Layer rewards are not accounted for and lost.
-
-## Vulnerability Detail
-
-Execution Layer rewards are not distributed through plain ETH transfers. Instead the balance of the block proposer fee recipient's address is directly updated. If the fee recipient getting the EL rewards is a smart contract, this means that the fallback/receive function is not called. Actually, a smart contract could receive EL rewards even if these functions are not defined.
-
-The [RioLRTRewardDistributor](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTRewardDistributor.sol) contract relies solely on its [receive](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTRewardDistributor.sol#L82-L94) function to distribute rewards. EL rewards which don't trigger this function are not accounted in the smart contract and there is no way of distributing them.
-
-## Impact
-
-Execution Layer rewards are lost.
-
-## Code Snippet
-
-## Tool used
-
-Manual Review
-
-## Recommendation
-
-Add a method to manually distribute EL rewards. For example:
-
-```solidity
-    function distributeRemainingBalance() external {
-        uint256 value = address(this).balance;
-
-        uint256 treasuryShare = value * treasuryETHValidatorRewardShareBPS / MAX_BPS;
-        uint256 operatorShare = value * operatorETHValidatorRewardShareBPS / MAX_BPS;
-        uint256 poolShare = value - treasuryShare - operatorShare;
-
-        if (treasuryShare > 0) treasury.transferETH(treasuryShare);
-        if (operatorShare > 0) operatorRewardPool.transferETH(operatorShare);
-        if (poolShare > 0) address(depositPool()).transferETH(poolShare);
-
-        emit ETHValidatorRewardsDistributed(treasuryShare, operatorShare, poolShare);
-    }
-```
-
-
-
-## Discussion
-
-**nevillehuang**
-
-request poc
-
-I need more information/resources for this issue so need to facilitate discussion.
-
-**sherlock-admin3**
-
-PoC requested from @fnanni-0
-
-Requests remaining: **6**
-
-**fnanni-0**
-
-@nevillehuang I forgot to link to the Rio docs: https://docs.rio.network/rio-architecture/deposits-and-withdraws/reward-distributor. Can we get @solimander input here? Reading this issue again, there is a chance I misunderstood the docs. Is the Reward Distributor contract expected to be able to receive Execution Layer rewards, i.e. be set as blocks fee_recipient address?
-
-#### If the answer is yes:
-
-From the [Solidity docs](https://docs.soliditylang.org/en/latest/contracts.html#receive-ether-function): "A contract without a receive Ether function can receive Ether as a recipient of a coinbase transaction". The recipient of a coinbase transaction post-merge is the address defined by the block proposer in the `fee_recipient` field of the [Execution Payload](https://github.com/ethereum/consensus-specs/blob/dev/specs/bellatrix/beacon-chain.md#executionpayload). According to https://eth2book.info/capella/annotated-spec/ : 
-
-> fee_recipient is the Ethereum account address that will receive the unburnt portion of the transaction fees (the priority fees). This has been called various things at various times: the original Yellow Paper calls it beneficiary; [EIP-1559](https://eips.ethereum.org/EIPS/eip-1559) calls it author. In any case, the proposer of the block sets the fee_recipient to specify where the appropriate transaction fees for the block are to be sent. Under proof of work this was the same address as the COINBASE address that received the block reward. Under proof of stake, the block reward is credited to the validator's beacon chain balance, and **the transaction fees are credited to the fee_recipient Ethereum address**.
-
-As an example go to etherscan and select any block recently produced. Check the fee recipient address. Check how its ETH balance is updated ("credited") at every transaction included in the block even though there is no explicit transaction to the fee recipient address (for example, balance update of beaverbuild [here](https://etherscan.io/tx/0xd6460ce006ff7d88d361fd2b08555e5e033208c187a16407f3a3bff304dd982d#statechange)).
-
-**solimander**
-
-Our operators will run MEV-Boost, which sets the fee recipient to the builder, who then transfers rewards to the proposer, which triggers the receive function.
-
-However, it seems worth adding a function to manually push rewards just in case. How does that affect severity here?
-
-**fnanni-0**
-
-@solimander I have a few questions:
-
-1. If mev-boost isn't available for a given block (for example there's a timeout), doesn't mev-boost fallback to a validator's local block proposal? See [this comment](https://github.com/flashbots/mev-boost/issues/222#issuecomment-1202401149) about Teku's client for instance (or Teku's [docs](https://docs.teku.consensys.io/concepts/builder-network#mev-boost)). In such case, fee_recipient would be the proposer address, not the builder's address.
-2. The flow you described is the current standarized payment method for mev-boost. I wonder if this could change or if there are other builder networks handling this differently. If so, I think it's risky to assume that the proposer address will always receive rewards through direct transfers.
-3. Isn't it likely that Ethereum upgrades in the future to better support Proposer-Builder Separation? If this happens, there's a chance the proposer address gets credited, not triggering the receive function.
-
-**solimander**
-
-> If mev-boost isn't available for a given block (for example there's a timeout), doesn't mev-boost fallback to a validator's local block proposal? See https://github.com/flashbots/mev-boost/issues/222#issuecomment-1202401149 about Teku's client for instance (or Teku's [docs](https://docs.teku.consensys.io/concepts/builder-network#mev-boost)). In such case, fee_recipient would be the proposer address, not the builder's address.
-
-I'm unsure, but that'd make sense. I'll be adding a function to manually split and push rewards regardless.
-
-**nevillehuang**
-
-This issue seems out of scope and hinges on external admin integrations. But leaving open for escalation period
-
-**sherlock-admin4**
-
-The protocol team fixed this issue in PR/commit https://github.com/rio-org/rio-sherlock-audit/pull/6.
-
-# Issue M-10: The protocol can't receive rewards because of low gas limits on ETH transfers 
-
-Source: https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/185 
-
-## Found by 
-0xkaden, Anubis, MatricksDeCoder, Topmark, Tricko, boredpukar, cats, deth, fnanni, hash, klaus, popular, sakshamguruji, zzykxx
-## Summary
-The hardcoded gas limit of the [Asset::transferETH()](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/utils/Asset.sol#L41-L46) function, used to transfer ETH in the protocol, is too low and will result unwanted reverts.
-
-## Vulnerability Detail
-ETH transfers in the protocol are always done via [Asset::transferETH()](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/utils/Asset.sol#L41-L46), which performs a low-level call with an hardcoded gas limit of `10_000`:
-```solidity
-(bool success,) = recipient.call{value: amount, gas: 10_000}('');
-if (!success) {revert ETH_TRANSFER_FAILED();}
-```
-
-The hardcoded `10_000` gas limit is not high enough for the protocol to be able receive and distribute rewards. Rewards are currently only available for native ETH, an are received by Rio via:
-- Partial withdrawals
-- ETH in excess of `32ETH` on full withdrawals
-
-The flow to receive rewards requires two steps:
-1. An initial call to [EigenPod::verifyAndProcessWithdrawals()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L232), which queues a withdrawal to the Eigenpod owner: an `RioLRTOperatorDelegator` instance
-2. A call to [DelayedWithdrawalRouter::claimDelayedWithdrawals()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/DelayedWithdrawalRouter.sol#L99).
-
-The call to [DelayedWithdrawalRouter::claimDelayedWithdrawals()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/DelayedWithdrawalRouter.sol#L99) triggers the following flow:
-1. ETH are transferred to the [RioLRTOperatorDelegator](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/restaking/RioLRTOperatorDelegator.sol#L244-L246) instance, where the `receive()` function is triggered.
-2. The `receive()` function of [RioLRTOperatorDelegator](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/restaking/RioLRTOperatorDelegator.sol#L244-L246) transfers ETH via [Asset::transferETH()](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/utils/Asset.sol#L41-L46) to the [RioLRTRewardDistributor](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/restaking/RioLRTRewardDistributor.sol#L82-L94), where another `receive()` function is triggered.
-3. The `receive()` function of [RioLRTRewardDistributor](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/restaking/RioLRTRewardDistributor.sol#L82-L94) transfers ETH via [Asset::transferETH()](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/utils/Asset.sol#L41-L46) to the `treasury`, the `operatorRewardPool` and the [`RioLRTDepositPool`](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/restaking/RioLRTDepositPool.sol).
-
-The gas is limited at `10_000` in step `2` and is not enough to perform step `3`, making it impossible for the protocol to receive rewards and leaving funds stuck.
-
-### POC
-Add the following imports to `RioLRTOperatorDelegator.t.sol`:
-```solidity
-import {IRioLRTOperatorRegistry} from 'contracts/interfaces/IRioLRTOperatorRegistry.sol';
-import {RioLRTOperatorDelegator} from 'contracts/restaking/RioLRTOperatorDelegator.sol';
-import {CredentialsProofs, BeaconWithdrawal} from 'test/utils/beacon-chain/MockBeaconChain.sol';
-```
-
-then copy-paste:
-```solidity
-function test_outOfGasOnRewards() public {
-    address alice = makeAddr("alice");
-    uint256 initialBalance = 40e18;
-    deal(alice, initialBalance);
-    vm.prank(alice);
-    reETH.token.approve(address(reETH.coordinator), type(uint256).max);
-
-    //->Operator delegator and validators are added to the protocol
-    uint8 operatorId = addOperatorDelegator(reETH.operatorRegistry, address(reETH.rewardDistributor));
-    RioLRTOperatorDelegator operatorDelegator =
-        RioLRTOperatorDelegator(payable(reETH.operatorRegistry.getOperatorDetails(operatorId).delegator));
-
-    //-> Alice deposits ETH in the protocol
-    vm.prank(alice);
-    reETH.coordinator.depositETH{value: initialBalance}();
-    
-    //-> Rebalance is called and the ETH deposited in a validator
-    vm.prank(EOA, EOA);
-    reETH.coordinator.rebalance(ETH_ADDRESS);
-
-    //-> Create a new validator with a 40ETH balance and verify his credentials.
-    //-> This is to "simulate" rewards accumulation
-    uint40[] memory validatorIndices = new uint40[](1);
-    IRioLRTOperatorRegistry.OperatorPublicDetails memory details = reETH.operatorRegistry.getOperatorDetails(operatorId);
-    bytes32 withdrawalCredentials = operatorDelegator.withdrawalCredentials();
-    beaconChain.setNextTimestamp(block.timestamp);
-    CredentialsProofs memory proofs;
-    (validatorIndices[0], proofs) = beaconChain.newValidator({
-        balanceWei: 40 ether,
-        withdrawalCreds: abi.encodePacked(withdrawalCredentials)
-    });
-    
-    //-> Verify withdrawal crendetials
-    vm.prank(details.manager);
-    reETH.operatorRegistry.verifyWithdrawalCredentials(
-        operatorId,
-        proofs.oracleTimestamp,
-        proofs.stateRootProof,
-        proofs.validatorIndices,
-        proofs.validatorFieldsProofs,
-        proofs.validatorFields
-    );
-
-    //-> Process a full withdrawal, 8ETH (40ETH - 32ETH) will be queued withdrawal as "rewards"
-    verifyAndProcessWithdrawalsForValidatorIndexes(address(operatorDelegator), validatorIndices);
-
-    //-> Call `claimDelayedWithdrawals` to claim the withdrawal
-    delayedWithdrawalRouter.claimDelayedWithdrawals(address(operatorDelegator), 1); //❌ Reverts for out-of-gas
-}
-```
-## Impact
-The protocol is unable to receive rewards and the funds will be stucked.
-
-## Code Snippet
-
-## Tool used
-
-Manual Review
-
-## Recommendation
-Remove the hardcoded `10_000` gas limit in [Asset::transferETH()](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/utils/Asset.sol#L41-L46), at least on ETH transfers where the destination is a protocol controlled contract.
-
 
 
 ## Discussion
 
 **sherlock-admin4**
 
-The protocol team fixed this issue in PR/commit https://github.com/rio-org/rio-sherlock-audit/pull/4.
+The protocol team fixed this issue in PR/commit https://github.com/rio-org/rio-sherlock-audit/pull/10.
 
-# Issue M-11: RioLRTIssuer::issueLRT reverts if deposit asset's approve method doesn't return a bool 
-
-Source: https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/189 
-
-## Found by 
-fibonacci, fugazzi
-## Summary
-
-Using `ERC20::approve` will not work with ERC20 tokens that do not return a bool.
-
-## Vulnerability Detail
-
-The contest's README states that tokens that may not return a bool on ERC20 methods (e.g., USDT) are supposed to be used.
-
-The `RioLRTIssuer::issueLRT` function makes a sacrificial deposit to prevent inflation attacks. To process the deposit, it calls the `ERC20::approve` method, which is expected to return a bool value.
-
-Solidity has return data length checks, and if the token implementation does not return a bool value, the transaction will revert.
-
-## Impact
-
-Issuing LRT tokens with an initial deposit in an asset that does not return a bool on an `approve` call will fail.
-
-## POC
-
-Add this file to the `test` folder. Run test with `forge test --mc POC --rpc-url=<mainnet-rpc-url> -vv`.
-
-```solidity
-// SPDX-License-Identifier: MIT
-pragma solidity 0.8.23;
-
-import {Test, console2} from 'forge-std/Test.sol';
-import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
-import {SafeERC20} from '@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol';
-
-contract POC is Test {
-    address constant USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
-    address immutable owner = makeAddr("owner");
-    address immutable spender = makeAddr("spender");
-
-    function setUp() external {
-       deal(USDT, owner, 1e6);
-    }
-
-    function testApproveRevert() external {
-        vm.prank(owner);
-        IERC20(USDT).approve(spender, 1e6);
-    }
-
-    function testApproveSuccess() external {
-        vm.prank(owner);
-        SafeERC20.forceApprove(IERC20(USDT), spender, 1e6);
-
-        uint256 allowance = IERC20(USDT).allowance(owner, spender);
-        assertEq(allowance, 1e6);
-    }
-}
-```
-
-## Code Snippet
-
-https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/restaking/RioLRTIssuer.sol#L172
-
-## Tool used
-
-Manual Review
-
-## Recommendation
-
-Use `forceApprove` from OpenZeppelin's `SafeERC20` library.
-
-
-
-## Discussion
-
-**sherlock-admin4**
-
-The protocol team fixed this issue in PR/commit https://github.com/rio-org/rio-sherlock-audit/pull/5.
-
-# Issue M-12: Stakers can avoid validator penalties 
-
-Source: https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/190 
-
-## Found by 
-monrel, zzykxx
-## Summary
-Stakers can frontrun validators penalties and slashing events with a withdrawal request in order to avoid the loss, this is possible if the deposit pool has enough liquidity available.
-
-## Vulnerability Detail
-Validators can lose part of their deposit via [penalties](https://eth2book.info/capella/part2/incentives/penalties/) or [slashing](https://eth2book.info/capella/part2/incentives/slashing/) events:
-- In case of penalties Eigenlayer can be notified of the balance drop via the permissionless function 
-[EigenPod::verifyBalanceUpdates()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L185). 
-- In case of slashing the validator is forced to exit and Eigenlayer can be notified via the permissionless function [EigenPod::verifyAndProcessWithdrawals()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L232) because the slashing event is effectively a full withdrawal.
-
-As soon as either [EigenPod::verifyBalanceUpdates()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L185) or [EigenPod::verifyAndProcessWithdrawals()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L232) is called the TVL of the Rio protocol drops instantly. This is because both of the functions update the variable [`podOwnerShares[podOwner]`](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPodManager.sol#L120):
-- [EigenPod::verifyBalanceUpdates()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L185) will update the variable [here](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L220)
-- [EigenPod::verifyAndProcessWithdrawals()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L232) will update the variable [here](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L275)
-
-This makes it possible for stakers to:
-1. Request a withdrawal via [RioLRTCoordinator::rebalance()](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/restaking/RioLRTCoordinator.sol#L99) for all the `LRTTokens` held.
-2. Call either [EigenPod::verifyBalanceUpdates()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L185) or [EigenPod::verifyAndProcessWithdrawals()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L232).
-
-At this point when [RioLRTCoordinator::rebalance()](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/restaking/RioLRTCoordinator.sol#L121) will be called and a withdrawal will be queued that does not include penalties or slashing. 
-
-It's possible to withdraw `LRTTokens` while avoiding penalties or slashing up to the amount of liquidity available in the deposit pool.
-
-### POC
-I wrote a POC whose main point is to show that requesting a withdrawal before an instant TVL drop will withdraw the full amount requested without taking the drop into account. The POC doesn't show that [EigenPod::verifyBalanceUpdates()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L185) or [EigenPod::verifyAndProcessWithdrawals()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L232) actually lowers the TVL because I wasn't able to implement it in the tests.
-
-Add imports to `RioLRTCoordinator.t.sol`:
-```solidity
-import {IRioLRTOperatorRegistry} from 'contracts/interfaces/IRioLRTOperatorRegistry.sol';
-import {RioLRTOperatorDelegator} from 'contracts/restaking/RioLRTOperatorDelegator.sol';
-import {CredentialsProofs, BeaconWithdrawal} from 'test/utils/beacon-chain/MockBeaconChain.sol';
-```
-
-then copy-paste:
-```solidity
-IRioLRTOperatorRegistry.StrategyShareCap[] public emptyStrategyShareCaps;
-function test_avoidInstantPriceDrop() public {
-    //-> Add two operators with 1 validator each
-    uint8[] memory operatorIds = addOperatorDelegators(
-        reETH.operatorRegistry,
-        address(reETH.rewardDistributor),
-        2,
-        emptyStrategyShareCaps,
-        1
-    );
-    address operatorAddress0 = address(uint160(1));
-
-    //-> Deposit ETH so there's 74ETH in the deposit pool
-    uint256 depositAmount = 2*ETH_DEPOSIT_SIZE - address(reETH.depositPool).balance;
-    uint256 amountToWithdraw = 10 ether;
-    reETH.coordinator.depositETH{value: amountToWithdraw + depositAmount}();
-
-    //-> Stake the 64ETH on the validators, 32ETH each and 10 ETH stay in the deposit pool
-    vm.prank(EOA, EOA);
-    reETH.coordinator.rebalance(ETH_ADDRESS);
-
-    //-> Attacker notices a validator is going receive penalties and immediately requests a withdrawal of 10ETH
-    reETH.coordinator.requestWithdrawal(ETH_ADDRESS, amountToWithdraw);
-
-    //-> Validator get some penalties and Eigenlayer notified 
-    //IMPORTANT: The following block of code it's a simulation of what would happen if a validator balances gets lowered because of penalties
-    //and `verifyBalanceUpdates()` gets called on Eigenlayer. It uses another bug to achieve an instant loss of TVL.
-
-    //      ~~~Start penalties simulation~~~
-    {
-        //-> Verify validators credentials of the two validators
-        verifyCredentialsForValidators(reETH.operatorRegistry, 1, 1);
-        verifyCredentialsForValidators(reETH.operatorRegistry, 2, 1);
-
-        //-> Cache current TVL and ETH Balance
-        uint256 TVLBefore = reETH.coordinator.getTVL();
-
-        //->Operator calls `undelegate()` on Eigenlayer
-        //IMPORTANT: This achieves the same a calling `verifyBalanceUpdates()` on Eigenlayer after a validator suffered penalties,
-        //an instant drop in TVL.
-        IRioLRTOperatorRegistry.OperatorPublicDetails memory details = reETH.operatorRegistry.getOperatorDetails(operatorIds[0]);
-        vm.prank(operatorAddress0);
-        delegationManager.undelegate(details.delegator);
-
-        //-> TVL dropped
-        uint256 TVLAfter = reETH.coordinator.getTVL();
-
-        assertLt(TVLAfter, TVLBefore);
-    }
-    //      ~~~End penalties simulation~~~
-
-    //-> Rebalance gets called
-    skip(reETH.coordinator.rebalanceDelay());
-    vm.prank(EOA, EOA);
-    reETH.coordinator.rebalance(ETH_ADDRESS);
-
-    //-> Attacker receives all of the ETH he withdrew, avoiding the effect of penalties
-    uint256 balanceBefore = address(this).balance;
-    reETH.withdrawalQueue.claimWithdrawalsForEpoch(IRioLRTWithdrawalQueue.ClaimRequest({asset: ETH_ADDRESS, epoch: 0}));
-    uint256 balanceAfter = address(this).balance;
-    assertEq(balanceAfter - balanceBefore, amountToWithdraw);
-}
-```
-
-## Impact
-Stakers can avoid validator penalties and slashing events if there's enough liquidity in the deposit pool.
-
-## Code Snippet
-
-## Tool used
-
-Manual Review
-
-## Recommendation
-When [RioLRTCoordinator::rebalance()](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/restaking/RioLRTCoordinator.sol#L121) is called and penalties or slashing events happened during the epoch being settled, distribute the correct amount of penalties to all the `LRTTokens` withdrawn in the current epoch, including the ones that requested the withdrawal before the drop.
-
-
-
-## Discussion
-
-**nevillehuang**
-
-Could be related to #52 and duplicates, both seems to involve front-running/sandwiching rebalance calls. Separated for now for further discussions
-
-
-**solimander**
-
-Valid, though need to take some time to consider whether this will be addressed. Could potentially frontrun slashing using any liquidity pool.
-
-# Issue M-13: Heap is incorrectly stores the removed operator ID which can lead to division by zero in deposit/withdrawal flow 
+# Issue H-8: Heap is incorrectly stores the removed operator ID which can lead to division by zero in deposit/withdrawal flow 
 
 Source: https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/193 
 
@@ -2532,132 +1164,551 @@ The protocol team fixed this issue in PR/commit https://github.com/rio-org/rio-s
 
 Severity could be higher, given a use of the function correctly results in blocking of withdrawals. Leaving medium for now on grounds of admin error
 
-# Issue M-14: Lack of slippage parameters can affect the LRT / share amounts during deposits / withdrawals 
+**shaka0x**
 
-Source: https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/214 
+Escalate
 
-The protocol has acknowledged this issue.
+> Leaving medium for now on grounds of admin error.
+
+I respectfully disagree with this reasoning. I think the severity of the issue and its duplicate should be high, as there is no admin error involved. There is an error in the implementation that is produced after an admin action. Otherwise, all issues at deployment or in protected functions can technically be considered as admin errors.
+
+
+
+
+
+**sherlock-admin2**
+
+> Escalate
+> 
+> > Leaving medium for now on grounds of admin error.
+> 
+> I respectfully disagree with this reasoning. I think the severity of the issue and its duplicate should be high, as there is no admin error involved. There is an error in the implementation that is produced after an admin action. Otherwise, all issues at deployment or in protected functions can technically be considered as admin errors.
+> 
+> 
+> 
+> 
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**nevillehuang**
+
+Agree that this issue should be high severity since withdrawals can be blocked permanently
+
+**Czar102**
+
+@nevillehuang @mstpr can't the admin remediate the situation?
+
+**nevillehuang**
+
+@solimander Could you confirm if admin remediation is possible by resetting validator cap of removed operator? Given the intended admin workflow results in blocking of funds I think the impact is severe
+
+**solimander**
+
+@nevillehuang Remediation is possible by deactivating the operator:
+
+```solidity
+// forge test --mt test_capped0ValidatorBricksFlowRecovery
+function test_capped0ValidatorBricksFlowRecovery() public {
+    // Add 3 operators
+    addOperatorDelegators(reLST.operatorRegistry, address(reLST.rewardDistributor), 3);
+
+    // The caps for each operator is 1000e18, we will delete the id 2 so we need funds there
+    // any number that is more than 1000 should be ok for that experiement
+    uint256 AMOUNT = 1002e18;
+
+    // Allocate to cbETH strategy.
+    cbETH.approve(address(reLST.coordinator), type(uint256).max);
+    uint256 lrtAmount = reLST.coordinator.deposit(CBETH_ADDRESS, AMOUNT);
+
+    // Push funds into EigenLayer.
+    vm.prank(EOA, EOA);
+    reLST.coordinator.rebalance(CBETH_ADDRESS);
+
+    // Build the empty caps
+    IRioLRTOperatorRegistry.StrategyShareCap[] memory zeroStrategyShareCaps =
+        new IRioLRTOperatorRegistry.StrategyShareCap[](1);
+    zeroStrategyShareCaps[0] = IRioLRTOperatorRegistry.StrategyShareCap({strategy: CBETH_STRATEGY, cap: 0});
+
+    // Set the caps of CBETH_STRATEGY for operator 2 as "0"
+    reLST.operatorRegistry.setOperatorStrategyShareCaps(2, zeroStrategyShareCaps);
+
+    // Try an another deposit, we expect revert when we do the rebalance
+    reLST.coordinator.deposit(CBETH_ADDRESS, 10e18);
+
+    // Push funds into EigenLayer. Expect revert, due to division by "0"
+    skip(reETH.coordinator.rebalanceDelay());
+    vm.startPrank(EOA, EOA);
+    vm.expectRevert(bytes4(keccak256('DivWadFailed()')));
+    reLST.coordinator.rebalance(CBETH_ADDRESS);
+    vm.stopPrank();
+
+    // Deactivate the operator to recover the system
+    reLST.operatorRegistry.deactivateOperator(2);
+
+    // Rebalance succeeds
+    vm.prank(EOA, EOA);
+    reLST.coordinator.rebalance(CBETH_ADDRESS);
+}
+```
+
+This acts as a temporary fix, which would unblock rebalances while the issue is patched.
+
+**mstpr**
+
+> @nevillehuang @mstpr can't the admin remediate the situation?
+
+not really.
+
+The admin needs to reset the cap for the operator. However, when this happens, the operator's cap is reset to "0," allowing deposits to be made again. If the admin sets an operator's cap to "0," it's likely that the operator will not be used. To address the above issue, the admin must reset it to a value. However, this means that new deposits can be made to the operator. Although the admin can set the cap back to a value, all users must withdraw their funds before new deposits are made. Since the admin does not control all users, this is not feasible and cannot be fixed in my opinion.
+
+
+If the operator is deactivated instead of its cap resetted to "0" then it is even worse. Then, the admin has to readd the operator back to system and needs to push funds to that operator such that the heap reorders correctly. Though, to do that admin needs significant amount of funds to push to system to increase the utilization. 
+
+Overall it might be possible but it is extremely hard and requires capital. What do you think @shaka0x @itsabinashb ?
+
+
+**shaka0x**
+
+> > @nevillehuang @mstpr can't the admin remediate the situation?
+> 
+> not really.
+> 
+> The admin needs to reset the cap for the operator. However, when this happens, the operator's cap is reset to "0," allowing deposits to be made again. If the admin sets an operator's cap to "0," it's likely that the operator will not be used. To address the above issue, the admin must reset it to a value. However, this means that new deposits can be made to the operator. Although the admin can set the cap back to a value, all users must withdraw their funds before new deposits are made. Since the admin does not control all users, this is not feasible and cannot be fixed in my opinion.
+> 
+> If the operator is deactivated instead of its cap resetted to "0" then it is even worse. Then, the admin has to readd the operator back to system and needs to push funds to that operator such that the heap reorders correctly. Though, to do that admin needs significant amount of funds to push to system to increase the utilization.
+> 
+> Overall it might be possible but it is extremely hard and requires capital. What do you think @shaka0x @itsabinashb ?
+
+I do agree with the above comments and would like to add that the proposed solution will not work for the cases described in my PoCs (https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/316), where the bug appears after deactivating an operator.
+
+**Czar102**
+
+@solimander do you agree with the above comments?
+
+@itsabinashb please do not post unnecessarily long code/result snippets directly in a comment, it's better to put them in a gist.
+
+If @solimander agrees, I'm planning to accept the escalation and consider this issue a valid High severity one.
+
+**solimander**
+
+@Czar102 After reviewing @shaka0x's POCs, I do agree with the above comments.
+
+**Czar102**
+
+Result:
+High
+Has duplicates
+
+**sherlock-admin3**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [shaka0x](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/193/#issuecomment-2023444945): accepted
+
+**zrax-x**
+
+@nevillehuang Is [issue#16](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/16) a duplicate? I can't seem to understand what the problem described in [issue#16](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/16) is.  I believe that it misses the point and has no negative impact.
+And [issue#155](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/155), [issue#127](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/127).
+
+**itsabinashb**
+
+> Is [issue#16](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/16) a duplicate? I can't seem to understand what the problem described in [issue#16](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/16) is. I believe that it misses the point and has no negative impact. And [issue#155](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/155).
+
+Issue number 16 shows exact root cause which is same as this submission.
+
+**zrax-x**
+
+> > Is [issue#16](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/16) a duplicate? I can't seem to understand what the problem described in [issue#16](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/16) is. I believe that it misses the point and has no negative impact. And [issue#155](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/155).
+> 
+> Issue number 16 shows exact root cause which is same as this submission.
+
+However, you did not accurately describe the harm caused, which is "division by zero".
+
+**solimander**
+
+I do agree that #16 does sort of miss the point as the core issue is not mentioned. The issue is not that the removed operator ID still exists in memory, but that it's not correctly removed from storage.
+
+# Issue M-1: Depositing to EigenLayer can revert due to round downs in converting shares<->assets 
+
+Source: https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/9 
 
 ## Found by 
-Bauer, HSP, PNS, abiih, almurhasan, avoloder, cats, iamandreiski, merlin, nisedo, sakshamguruji, sunill\_eth, thank\_you, zraxx
+0xkaden, Bauer, Drynooo, KupiaSec, Tricko, hash, kennedy1030, klaus, lemonmon, mstpr-brainbot, shaka
 ## Summary
-
-During both deposits and withdrawals, the amount that the user receives in LRT tokens (during deposits) or amount of shares (during withdrawals) Is dependent on mainly the correlation between the supply of the given asset, the TVL (total value locked) and the price fetched from an oracle. 
-
-Since the total value locked is dependent on the amount of shares recorded in the accounting system for the underlying asset in-question / all assets (updated during rebalances) + the balance of the assets in the contract (updated whenever the deposit is sent) this means that the value a user receives in return when depositing is dependent on the of the amount of shares + the current balance recorded in the protocol. 
-
-During stepwise jumps in rewards accumulation and/or large deposits/withdrawals to/from the system, the TVL can drastically change, affecting the price ratio between the underlying assets and LRT. Users can get receive less LRT/shares than expected their deposit/withdrawal transaction was frontrun by a very large transaction, the protocol was rebalanced, etc.
-
+When the underlying tokens deposited from depositPool to EigenLayer strategy, there are bunch of converting operations done which rounds down the solution at some point and the require check reverts hence, the depositing might not be possible due to this small round down issue. 
 ## Vulnerability Detail
+Best to go for this is an example, so let's do it.
 
-When deposits are made, the calculations for the amount of LRT tokens the user will get in return versus the number of shares is calculated by using the following formulas. Let's take a look at the deposit flow:
+Assume the deposit pool has 111 * 1e18 stETH waiting for rebalance to be deposited to EigenLayer and there is only 1 operator with 1 strategy allowed which is the EigenLayers stETH strategy. 
+Also, assume the EigenLayer has 3333 * 1e18 stETH in total and 3232  * 1e18 shares in supply. Also, note that the EigenLayer uses virtual shares offset which is 1e3.
 
-**Deposits:**
-
-Once `amountOut` is calculated, this will determine the amount of LRT tokens that the user will receive in exchange for their deposit in the underlying token (for e.g. reETH, cbETH, etc.) 
-
-`        amountOut = convertFromAssetToRestakingTokens(asset, amountIn);`
-
+Now, let's say there is no withdrawal queue to ease the complexity of the issue and rebalance is called and the balance in the deposit pool will be forwarded to EigenLayer strategy as follows:
 ```solidity
-  function convertFromAssetToRestakingTokens(address asset, uint256 amount) public view returns (uint256) {
-        uint256 value = assetRegistry().convertToUnitOfAccountFromAsset(asset, amount);
-        return convertFromUnitOfAccountToRestakingTokens(value);
+function rebalance(address asset) external checkRebalanceDelayMet(asset) {
+        .
+        .
+        // Deposit remaining assets into EigenLayer.
+        (uint256 sharesReceived, bool isDepositCapped) = depositPool().depositBalanceIntoEigenLayer(asset);
+        .
     }
 ```
-From the above the `value` parameter will be calculated by fetching the price from the price oracle: 
 
-```solidity
-function convertToUnitOfAccountFromAsset(address asset, uint256 amount) public view returns (uint256) {
-        if (asset == ETH_ADDRESS) {
-            return amount;
-        }
-        address priceFeed = assetInfo[asset].priceFeed;
-        uint256 price = getPrice(priceFeed);
-
-        return _normalizeDecimals(price * amount / priceScale, assetInfo[asset].decimals, priceFeedDecimals);
+Then, the `depositBalanceIntoEigenLayer` will trigger the `OperatorOperations.depositTokenToOperators` function as follows:
+```solidity 
+function depositBalanceIntoEigenLayer(address asset) external onlyCoordinator returns (uint256, bool) {
+        uint256 amountToDeposit = asset.getSelfBalance();
+        if (amountToDeposit == 0) return (0, false);
+        .
+        .
+        address strategy = assetRegistry().getAssetStrategy(asset);
+        uint256 sharesToAllocate = assetRegistry().convertToSharesFromAsset(asset, amountToDeposit);
+        // @review library called
+        -> return (OperatorOperations.depositTokenToOperators(operatorRegistry(), asset, strategy, sharesToAllocate), isDepositCapped);
     }
 ```
-After `value` is returned using the above calculations, then we will call the `convertFromUnitOfAccountToRestakingTokens()` with the `value` parameter as a function argument. This function will output the amount of LRT tokens that the user should receive based on the calculations below:
+As we can see in the above snippet, the underlying tokens to be deposited which is 111 * 1e18 stETH in our example will be converted to EigenLayer strategy shares via `assetRegistry().convertToSharesFromAsset`
 
+Now, how does EigenLayer calculates how much shares to be minted given an underlying token deposit is as follows:
 ```solidity
-function convertFromUnitOfAccountToRestakingTokens(uint256 value) public view returns (uint256) {
-        uint256 tvl = getTVL();
-        uint256 supply = token.totalSupply();
-
-        if (supply == 0) {
-            return value;
-        }
-        return value * supply / tvl;
+function underlyingToSharesView(uint256 amountUnderlying) public view virtual returns (uint256) {
+        // account for virtual shares and balance
+        uint256 virtualTotalShares = totalShares + SHARES_OFFSET;
+        uint256 virtualTokenBalance = _tokenBalance() + BALANCE_OFFSET;
+        // calculate ratio based on virtual shares and balance, being careful to multiply before dividing
+        return (amountUnderlying * virtualTotalShares) / virtualTokenBalance;
     }
 ```
-As we can see, the above function utilizes the TVL (Total Value Locked) in the protocol (of all underlying assets) to come up with the price. The TVL is greatly dependent on the amount of shares currently accounted for in the system: 
 
+Now, let's plugin our numbers in the example to calculate how much shares would be minted according to EigenLayer:
+`virtualTotalShares` = 3232 * 1e18 + 1e3
+`virtualTokenBalance` = 3333 * 1e18 + 1e3
+`amountUnderlying` = 111 * 1e18
+
+**and when we do the math we will calculate the shares to be minted as:
+107636363636363636364**
+
+Then, the library function will be executed as follows:
 ```solidity
-function getTVLForAsset(address asset) public view returns (uint256) {
-        uint256 balance = getTotalBalanceForAsset(asset);
-        if (asset == ETH_ADDRESS) {
-            return balance;
+function depositTokenToOperators(
+        IRioLRTOperatorRegistry operatorRegistry,
+        address token,
+        address strategy,
+        uint256 sharesToAllocate // @review 107636363636363636364 as we calculated above!
+    ) internal returns (uint256 sharesReceived) {
+        (uint256 sharesAllocated, IRioLRTOperatorRegistry.OperatorStrategyAllocation[] memory  allocations) = operatorRegistry.allocateStrategyShares(
+            strategy, sharesToAllocate
+        );
+
+        for (uint256 i = 0; i < allocations.length; ++i) {
+            IRioLRTOperatorRegistry.OperatorStrategyAllocation memory allocation = allocations[i];
+
+            IERC20(token).safeTransfer(allocation.delegator, allocation.tokens);
+            sharesReceived += IRioLRTOperatorDelegator(allocation.delegator).stakeERC20(strategy, token, allocation.tokens);
         }
-        return convertToUnitOfAccountFromAsset(asset, balance);
-```
-
-The way that `balance` is calculated, since it's crucial for the TVL which is based on balance * oraclePriceForAsset; it takes into consideration all of the asset shares held in Rio: `assetInfo[asset].shares` + the `balanceOf(asset)`:
-
-```solidity
-  uint256 sharesHeld = getAssetSharesHeld(asset);
-        uint256 tokensInRio = IERC20(asset).balanceOf(depositPool_);
-        uint256 tokensInEigenLayer = convertFromSharesToAsset(getAssetStrategy(asset), sharesHeld);
-
-        return tokensInRio + tokensInEigenLayer;
-```
-
-**PoC**
-- For simpler calculations, let's say that Alice wants to deposit ETH through the `depositETH()` function:
-
-```solidity
-        // Convert deposited ETH to restaking tokens and mint to the caller.
-        amountOut = convertFromUnitOfAccountToRestakingTokens(msg.value);
-
-        // Forward ETH to the deposit pool.
-        address(depositPool()).transferETH(msg.value);
-```
-- Alice wants to deposit 1 ETH (1e18), the current protocol TVL is 35e18, and the total supply of ETH is 12e25.
-- To calculate the `amountOut`:
-```solidity
- function convertFromUnitOfAccountToRestakingTokens(uint256 value) public view returns (uint256) {
-        uint256 tvl = getTVL();
-        uint256 supply = token.totalSupply();
-
-        if (supply == 0) {
-            return value;
-        }
-        return value * supply / tvl;
+        if (sharesReceived != sharesAllocated) revert INCORRECT_NUMBER_OF_SHARES_RECEIVED();
     }
 ```
-- 1e18 * 12e25 / 1500e18.
-- The amount of shares she will receive is 1.2e24
-- If she was frontrun by a large transaction of let's say 200 ETH
-- The amount would be: 1e18 * 12e25 / 1700e18 = 7e22.
 
+The very first line of the above snippet executes the `operatorRegistry.allocateStrategyShares`, let's examine that:
+```solidity
+ function allocateStrategyShares(address strategy, uint256 sharesToAllocate) external onlyDepositPool returns (uint256 sharesAllocated, OperatorStrategyAllocation[] memory allocations) {
+        .
+        uint256 remainingShares = sharesToAllocate;
+        allocations = new OperatorStrategyAllocation[](s.activeOperatorCount);
+        while (remainingShares > 0) {
+            .
+            .
+            uint256 newShareAllocation = FixedPointMathLib.min(operatorShares.cap - operatorShares.allocation, remainingShares);
+            uint256 newTokenAllocation = IStrategy(strategy).sharesToUnderlyingView(newShareAllocation);
+            allocations[allocationIndex] = OperatorStrategyAllocation(
+                operator.delegator,
+                newShareAllocation,
+                newTokenAllocation
+            );
+            remainingShares -= newShareAllocation;
+            .
+            .
+        }
+        sharesAllocated = sharesToAllocate - remainingShares;
+        .
+        .
+    }
+```
+
+So, let's value the above snippet aswell considering the cap is not reached. As we can see the how much underlying token needed is again calculated by querying the EigenLayer strategy `sharesToUnderlyingView`, so let's first calculate that:
+```solidity
+function sharesToUnderlyingView(uint256 amountShares) public view virtual override returns (uint256) {
+        // account for virtual shares and balance
+        uint256 virtualTotalShares = totalShares + SHARES_OFFSET;
+        uint256 virtualTokenBalance = _tokenBalance() + BALANCE_OFFSET;
+        // calculate ratio based on virtual shares and balance, being careful to multiply before dividing
+        return (virtualTokenBalance * amountShares) / virtualTotalShares;
+    }
+```
+Let's put the values to above snippet:
+`virtualTotalShares` = 3232 * 1e18 + 1e3
+`virtualTokenBalance` = 3333 * 1e18 + 1e3
+`amountShares` = 107636363636363636364
+**hence, the return value is 110999999999999999999(as you noticed it is not 111 * 1e18 as we expect!)**
+
+`sharesToAllocate` =  remainingShares  = newShareAllocation  = 107636363636363636364
+`newTokenAllocation` = 110999999999999999999
+`sharesAllocated` = 107636363636363636364
+
+Now, let's go back to `depositTokenToOperators` function and move with the execution flow:
+
+as we can see the underlying tokens we calculated (110999999999999999999) is deposited to EigenLayer for shares here and then compared in the last line in the if check as follows:
+```solidity
+for (uint256 i = 0; i < allocations.length; ++i) {
+            IRioLRTOperatorRegistry.OperatorStrategyAllocation memory allocation = allocations[i];
+
+            IERC20(token).safeTransfer(allocation.delegator, allocation.tokens);
+            sharesReceived += IRioLRTOperatorDelegator(allocation.delegator).stakeERC20(strategy, token, allocation.tokens);
+        }
+        if (sharesReceived != sharesAllocated) revert INCORRECT_NUMBER_OF_SHARES_RECEIVED();
+```
+
+`stakeERC20` will stake 110999999999999999999 tokens and in exchange **will receive 107636363636363636363** shares. Then the `sharesReceived` will be compared with the **initial share amount calculation which is 107636363636363636364**
+
+**hence, the last if check will revert because
+107636363636363636363 != 107636363636363636364**
+
+**Coded PoC:**
+```solidity
+function test_RioRoundingDownPrecision() external pure returns (uint, uint) {
+        uint underlyingTokens = 111 * 1e18;
+        uint totalUnderlyingTokensInEigenLayer = 3333 * 1e18;
+        uint totalSharesInEigenLayer = 3232 * 1e18;
+        uint SHARE_AND_BALANCE_OFFSET = 1e3;
+
+        uint virtualTotalShares =  totalSharesInEigenLayer + SHARE_AND_BALANCE_OFFSET;
+        uint virtualTokenBalance = totalUnderlyingTokensInEigenLayer + SHARE_AND_BALANCE_OFFSET;
+
+        uint underlyingTokensToEigenLayerShares = (underlyingTokens * virtualTotalShares) / virtualTokenBalance;
+        uint eigenSharesToUnderlying = (virtualTokenBalance * underlyingTokensToEigenLayerShares) / virtualTotalShares;
+
+        // we expect eigenSharesToUnderlying == underlyingTokens, which is not
+        require(eigenSharesToUnderlying != underlyingTokens);
+
+        return (underlyingTokensToEigenLayerShares, eigenSharesToUnderlying);
+    }
+```
 ## Impact
-
-LRT tokens received in exchange for the underlying assets can vary and lead to unwanted outcomes due to the price dependency on the TVL as well as the amount of tokens received by the user is determined by an interaction with an oracle, meaning that the amount received in return may vary indefinitely while the request is waiting to be executed.
-This is due to a lack of slippage control on any of the deposit / withdrawal functions. 
-
+The issue described above can happen frequently as long as the perfect division is not happening when converting shares/assets. In order to solve the issue the amounts and shares has to be perfectly divisible such that the rounding down is not an issue. This can be fixed by owner to airdrop some assets such that this is possible. However, considering how frequent and easy the above scenario can happen and owner needs to do some math to fix the issue, I'll label this as high.
 ## Code Snippet
-https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/restaking/RioLRTCoordinator.sol#L79
+https://github.com/sherlock-audit/2024-02-rio-vesting-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTDepositPool.sol#L47-L67
 
-https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/restaking/RioLRTCoordinator.sol#L162-L169
+https://github.com/sherlock-audit/2024-02-rio-vesting-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTAssetRegistry.sol#L215-L221
 
-https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/restaking/RioLRTCoordinator.sol#L219
+https://github.com/Layr-Labs/eigenlayer-contracts/blob/5c192e1a780c22e027f6861f958db90fb9ae263c/src/contracts/strategies/StrategyBase.sol#L211-L243
 
+https://github.com/sherlock-audit/2024-02-rio-vesting-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/utils/OperatorOperations.sol#L51-L68
+
+https://github.com/sherlock-audit/2024-02-rio-vesting-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTOperatorRegistry.sol#L342-L392
+
+https://github.com/sherlock-audit/2024-02-rio-vesting-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTOperatorDelegator.sol#L174-L179
 ## Tool used
 
 Manual Review
 
 ## Recommendation
 
-Include minimumOut parameters and maybe a deadline as well to enforce slippage control to the deposit/withdraw transactions in order to prevent unwanted outcomes.
+
+
+## Discussion
+
+**sherlock-admin4**
+
+The protocol team fixed this issue in PR/commit https://github.com/rio-org/rio-sherlock-audit/pull/11.
+
+# Issue M-2: Ether can stuck when an operators validators are removed due to an user front-running 
+
+Source: https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/45 
+
+## Found by 
+hash, mstpr-brainbot, zzykxx
+## Summary
+When a full withdrawal occurs in the EigenPod, the excess amount can remain idle within the EigenPod and can only be swept by calling a function in the delegator contract of a specific operator. However, in cases where the owner removes all validators for emergencies or any other reason, a user can frontrun the transaction, willingly or not, causing the excess ETH to become stuck in the EigenPod. The only way to recover the ether would be for the owner to reactivate the validators, which may not be intended since the owner initially wanted to remove all the validators and now needs to add them again.
+## Vulnerability Detail
+Let's assume a Layered Relay Token (LRT) with a beacon chain strategy and only two operators for simplicity. Each operator is assigned two validators, allowing each operator to stake 64 ETH in the PoS staking via the EigenPod.
+
+At any time, the EigenPod owner can update the effective balance of the validators' PoS staking by calling this function:
+https://github.com/Layr-Labs/eigenlayer-contracts/blob/6de01c6c16d6df44af15f0b06809dc160eac0ebf/src/contracts/pods/EigenPod.sol#L294-L345
+This function can be triggered by the owner of the operator registry or proof uploader by invoking this function:
+https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTOperatorRegistry.sol#L236-L253
+
+Now, let's consider a scenario where the effective verified balance of the most utilized operator is 64 ETH, and the operator's validators need to be shut down. In such a case, the operator registry admin can call this function to withdraw the entire ETH balance from the operator's delegator:
+https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTOperatorRegistry.sol#L163-L165
+
+This function triggers a full withdrawal from the operator's delegator EigenPod. The `queueOperatorStrategyExit` function will withdraw the entire validator balance as follows:
+```solidity
+if (validatorDetails.cap > 0 && newValidatorCap == 0) {
+            // If there are active deposits, queue the operator for strategy exit.
+            if (activeDeposits > 0) {
+                -> operatorDetails.queueOperatorStrategyExit(operatorId, BEACON_CHAIN_STRATEGY);
+                .
+            }
+           .
+        } else if (validatorDetails.cap == 0 && newValidatorCap > 0) {
+           .
+        } else {
+           .
+        }
+```
+
+`operatorDetails.queueOperatorStrategyExit` function will full withdraw the entire validator balance as follows:
+
+```solidity
+function queueOperatorStrategyExit(IRioLRTOperatorRegistry.OperatorDetails storage operator, uint8 operatorId, address strategy) internal {
+        IRioLRTOperatorDelegator delegator = IRioLRTOperatorDelegator(operator.delegator);
+
+        uint256 sharesToExit;
+        if (strategy == BEACON_CHAIN_STRATEGY) {
+            // Queues an exit for verified validators only. Unverified validators must by exited once verified,
+            // and ETH must be scraped into the deposit pool. Exits are rounded to the nearest Gwei. It is not
+            // possible to exit ETH with precision less than 1 Gwei. We do not populate `sharesToExit` if the
+            // Eigen Pod shares are not greater than 0.
+            int256 eigenPodShares = delegator.getEigenPodShares();
+            if (eigenPodShares > 0) {
+                sharesToExit = uint256(eigenPodShares).reducePrecisionToGwei();
+            }
+        } else {
+            .
+        }
+        .
+    }
+```
+As observed, the entire EigenPod shares are requested as a withdrawal, which is 64 Ether. However, a user can request a 63 Ether withdrawal before the owner's transaction from the coordinator, which would also trigger a full withdrawal of 64 Ether. In the end, the user would receive 63 Ether, leaving 1 Ether idle in the EigenPod:
+ 
+```solidity
+function queueETHWithdrawalFromOperatorsForUserSettlement(IRioLRTOperatorRegistry operatorRegistry, uint256 amount) internal returns (bytes32 aggregateRoot) {
+        .
+        for (uint256 i = 0; i < length; ++i) {
+            address delegator = operatorDepositDeallocations[i].delegator;
+
+            -> // Ensure we do not send more than needed to the withdrawal queue. The remaining will stay in the Eigen Pod.
+            uint256 amountToWithdraw = (i == length - 1) ? remainingAmount : operatorDepositDeallocations[i].deposits * ETH_DEPOSIT_SIZE;
+
+            remainingAmount -= amountToWithdraw;
+            roots[i] = IRioLRTOperatorDelegator(delegator).queueWithdrawalForUserSettlement(BEACON_CHAIN_STRATEGY, amountToWithdraw);
+        }
+        .
+    }
+```
+
+In such a scenario, the queued amount would be 63 Ether, and 1 Ether would remain idle in the EigenPod. Since the owner's intention was to shut down the validators in the operator for good, that 1 Ether needs to be scraped as well. However, the owner is unable to sweep it due to `MIN_EXCESS_FULL_WITHDRAWAL_ETH_FOR_SCRAPE`:
+```solidity
+function scrapeExcessFullWithdrawalETHFromEigenPod() external {
+        // @review this is 1 ether
+        uint256 ethWithdrawable = eigenPod.withdrawableRestakedExecutionLayerGwei().toWei();
+        // @review this is also 1 ether
+        -> uint256 ethQueuedForWithdrawal = getETHQueuedForWithdrawal();
+        if (ethWithdrawable <= ethQueuedForWithdrawal + MIN_EXCESS_FULL_WITHDRAWAL_ETH_FOR_SCRAPE) {
+            revert INSUFFICIENT_EXCESS_FULL_WITHDRAWAL_ETH();
+        }
+        _queueWithdrawalForOperatorExitOrScrape(BEACON_CHAIN_STRATEGY, ethWithdrawable - ethQueuedForWithdrawal);
+    }
+```
+
+Which means that owner has to set the validator caps for the operator again to recover that 1 ether which might not be possible since the owner decided to shutdown the entire validators for the specific operator. 
+
+**Another scenario from same root cause:**
+1- There are 64 ether in an operator 
+2- Someone requests a withdrawal of 50 ether
+3- All 64 ether is withdrawn from beacon chain 
+4- 50 ether sent to the users withdrawal, 14 ether is idle in the EigenPod waiting for someone to call `scrapeExcessFullWithdrawalETHFromEigenPod`
+5- An user quickly withdraws 13 ether
+6- `withdrawableRestakedExecutionLayerGwei` is 1 ether and `INSUFFICIENT_EXCESS_FULL_WITHDRAWAL_ETH` also 1 ether. Which means the 1 ether can't be re-added to deposit pool until someone withdraws.
+
+**Coded PoC:**
+```solidity
+// forge test --match-contract RioLRTOperatorDelegatorTest --match-test test_StakeETHCalledWith0Ether -vv
+    function test_StuckEther() public {
+        uint8 operatorId = addOperatorDelegator(reETH.operatorRegistry, address(reETH.rewardDistributor));
+        address operatorDelegator = reETH.operatorRegistry.getOperatorDetails(operatorId).delegator;
+
+        uint256 TVL = 64 ether;
+        uint256 WITHDRAWAL_AMOUNT = 63 ether;
+        RioLRTOperatorDelegator delegatorContract = RioLRTOperatorDelegator(payable(operatorDelegator));
+
+        // Allocate ETH.
+        reETH.coordinator.depositETH{value: TVL - address(reETH.depositPool).balance}();
+
+
+        // Push funds into EigenLayer.
+        vm.prank(EOA, EOA);
+        reETH.coordinator.rebalance(ETH_ADDRESS);
+
+
+        // Verify validator withdrawal credentials.
+        uint40[] memory validatorIndices = verifyCredentialsForValidators(reETH.operatorRegistry, operatorId, 2);
+
+
+        // Verify and process two full validator exits.
+        verifyAndProcessWithdrawalsForValidatorIndexes(operatorDelegator, validatorIndices);
+
+        // Withdraw some funds.
+        reETH.coordinator.requestWithdrawal(ETH_ADDRESS, WITHDRAWAL_AMOUNT);
+        uint256 withdrawalEpoch = reETH.withdrawalQueue.getCurrentEpoch(ETH_ADDRESS);
+
+        // Skip ahead and rebalance to queue the withdrawal within EigenLayer.
+        skip(reETH.coordinator.rebalanceDelay());
+
+        vm.prank(EOA, EOA);
+        reETH.coordinator.rebalance(ETH_ADDRESS);
+
+        // Verify and process two full validator exits.
+        verifyAndProcessWithdrawalsForValidatorIndexes(operatorDelegator, validatorIndices);
+
+        // Settle with withdrawal epoch.
+        IDelegationManager.Withdrawal[] memory withdrawals = new IDelegationManager.Withdrawal[](1);
+        withdrawals[0] = IDelegationManager.Withdrawal({
+            staker: operatorDelegator,
+            delegatedTo: address(1),
+            withdrawer: address(reETH.withdrawalQueue),
+            nonce: 0,
+            startBlock: 1,
+            strategies: BEACON_CHAIN_STRATEGY.toArray(),
+            shares: WITHDRAWAL_AMOUNT.toArray()
+        });
+        reETH.withdrawalQueue.settleEpochFromEigenLayer(ETH_ADDRESS, withdrawalEpoch, withdrawals, new uint256[](1));
+
+        vm.expectRevert(bytes4(keccak256("INSUFFICIENT_EXCESS_FULL_WITHDRAWAL_ETH()")));
+        delegatorContract.scrapeExcessFullWithdrawalETHFromEigenPod();
+    }
+```
+
+## Impact
+Owner needs to set the caps again to recover the 1 ether. However, the validators are removed for a reason and adding operators again would probably be not intended since it was a shutdown. Hence, I'll label this as medium.
+## Code Snippet
+https://github.com/Layr-Labs/eigenlayer-contracts/blob/6de01c6c16d6df44af15f0b06809dc160eac0ebf/src/contracts/pods/EigenPod.sol#L294-L345
+
+https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTOperatorRegistry.sol#L236-L253
+
+https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/utils/OperatorRegistryV1Admin.sol#L276-L319
+
+https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTOperatorDelegator.sol#L225-L227
+
+https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/utils/OperatorRegistryV1Admin.sol#L144-L165
+
+https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTOperatorDelegator.sol#L253-L273
+
+https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTCoordinator.sol#L99-L116
+
+https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/utils/OperatorOperations.sol#L88-L107
+
+https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTOperatorDelegator.sol#L160-L167
+## Tool used
+
+Manual Review
+
+## Recommendation
+Make an emergency function which owner can scrape the excess eth regardless of `MIN_EXCESS_FULL_WITHDRAWAL_ETH_FOR_SCRAPE`
 
 
 
@@ -2665,19 +1716,1156 @@ Include minimumOut parameters and maybe a deadline as well to enforce slippage c
 
 **nevillehuang**
 
-Borderline medium/low leaving open for discussion.
+Borderline Medium/Low, leaving open for discussion. I think I agree with watsons, unless there is someway to retrieve the potentially locked ETH.
 
 **solimander**
 
-Consider low severity - oracle updates of underlying assets and reward distributions are unlikely to cause a meaningful change to the output amount.
+Accepted risk of design, though considering adding an emergency scrape function to avoid the possible annoyance.
 
 **nevillehuang**
 
-I believe this should have been a known consideration stated in the contest details, so leaving as medium severity
+I believe this risk should have been mentioned in contest details, so leaving as medium severity.
 
-# Issue M-15: All operators can have ETH deposits regardless of the cap setted for them leading to miscalculated TVL 
+**sherlock-admin4**
+
+The protocol team fixed this issue in PR/commit https://github.com/rio-org/rio-sherlock-audit/pull/9.
+
+# Issue M-3: A part of ETH rewards can be stolen by sandwiching `claimDelayedWithdrawals()` 
+
+Source: https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/52 
+
+The protocol has acknowledged this issue.
+
+## Found by 
+araj, aslanbek, cats, giraffe, pontifex, zzykxx
+## Summary
+Rewards can be stolen by sandwiching the call to [EigenLayer::DelayedWithdrawalRouter::claimDelayedWithdrawals()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/DelayedWithdrawalRouter.sol#L99).
+
+## Vulnerability Detail
+The protocol handles ETH rewards by sending them to the [rewards distributor](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/restaking/RioLRTRewardDistributor.sol). There are at least 3 flows that end-up sending funds there:
+1. When the function [RioLRTOperatorDelegator::scrapeNonBeaconChainETHFromEigenPod()](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/restaking/RioLRTOperatorDelegator.sol#L150) is called to scrape non beacon chain ETH from an Eigenpod.
+2. When a validator receives rewards via partial withdrawals after the function [EigenPod::verifyAndProcessWithdrawals()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L232) is called.
+3. When a validator exists and has more than 32ETH the excess will be sent as rewards after the function [EigenPod::verifyAndProcessWithdrawals()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L232) is called.
+
+All of these 3 flows end up queuing a withdrawal to the [rewards distributor](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/restaking/RioLRTRewardDistributor.sol). After a delay the rewards can claimed by calling the permissionless function [EigenLayer::DelayedWithdrawalRouter::claimDelayedWithdrawals()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/DelayedWithdrawalRouter.sol#L99), this call will instantly increase the TVL of the protocol.
+
+An attacker can take advantage of this to steal a part of the rewards:
+1. Mint a sensible amount of `LRTTokens` by depositing an accepted asset
+2. Call [EigenLayer::DelayedWithdrawalRouter::claimDelayedWithdrawals()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/DelayedWithdrawalRouter.sol#L99), after which the value of the `LRTTokens` just minted will immediately increase.
+3. Request a withdrawal for all the `LRTTokens` via [RioLRTCoordinator::requestWithdrawal()](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/restaking/RioLRTCoordinator.sol#L99).
+
+### POC
+Change [RioLRTRewardsDistributor::receive()](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/restaking/RioLRTOperatorDelegator.sol#L244-L246) (to side-step a gas limit bug:
+```solidity
+receive() external payable {
+    (bool success,) = address(rewardDistributor()).call{value: msg.value}('');
+    require(success);
+}
+```
+
+Add the following imports to `RioLRTOperatorDelegator`:
+```solidity
+import {IRioLRTWithdrawalQueue} from 'contracts/interfaces/IRioLRTWithdrawalQueue.sol';
+import {IRioLRTOperatorRegistry} from 'contracts/interfaces/IRioLRTOperatorRegistry.sol';
+import {CredentialsProofs, BeaconWithdrawal} from 'test/utils/beacon-chain/MockBeaconChain.sol';
+```
+To copy-paste in `RioLRTOperatorDelegator.t.sol`:
+
+```solidity
+function test_stealRewards() public {
+    address alice = makeAddr("alice");
+    address bob = makeAddr("bob");
+    uint256 aliceInitialBalance = 40e18;
+    uint256 bobInitialBalance = 40e18;
+    deal(alice, aliceInitialBalance);
+    deal(bob, bobInitialBalance);
+    vm.prank(alice);
+    reETH.token.approve(address(reETH.coordinator), type(uint256).max);
+    vm.prank(bob);
+    reETH.token.approve(address(reETH.coordinator), type(uint256).max);
+
+    //->Operator delegator and validators are added to the protocol
+    uint8 operatorId = addOperatorDelegator(reETH.operatorRegistry, address(reETH.rewardDistributor));
+    RioLRTOperatorDelegator operatorDelegator =
+        RioLRTOperatorDelegator(payable(reETH.operatorRegistry.getOperatorDetails(operatorId).delegator));
+
+    //-> Alice deposits ETH in the protocol
+    vm.prank(alice);
+    reETH.coordinator.depositETH{value: aliceInitialBalance}();
+    
+    //-> Rebalance is called and the ETH deposited in a validator
+    vm.prank(EOA, EOA);
+    reETH.coordinator.rebalance(ETH_ADDRESS);
+
+    //-> Create a new validator with a 40ETH balance and verify his credentials.
+    //-> This is to "simulate" rewards accumulation
+    uint40[] memory validatorIndices = new uint40[](1);
+    IRioLRTOperatorRegistry.OperatorPublicDetails memory details = reETH.operatorRegistry.getOperatorDetails(operatorId);
+    bytes32 withdrawalCredentials = operatorDelegator.withdrawalCredentials();
+    beaconChain.setNextTimestamp(block.timestamp);
+    CredentialsProofs memory proofs;
+    (validatorIndices[0], proofs) = beaconChain.newValidator({
+        balanceWei: 40 ether,
+        withdrawalCreds: abi.encodePacked(withdrawalCredentials)
+    });
+    
+    //-> Verify withdrawal crendetials
+    vm.prank(details.manager);
+    reETH.operatorRegistry.verifyWithdrawalCredentials(
+        operatorId,
+        proofs.oracleTimestamp,
+        proofs.stateRootProof,
+        proofs.validatorIndices,
+        proofs.validatorFieldsProofs,
+        proofs.validatorFields
+    );
+
+    //-> A full withdrawal for the validator is processed, 8ETH (40ETH - 32ETH) will be queued as rewards
+    verifyAndProcessWithdrawalsForValidatorIndexes(address(operatorDelegator), validatorIndices);
+
+    //-> Bob, an attacker, does the following:
+    //      1. Deposits 40ETH and receives ~40e18 LRTTokens
+    //      2. Cliam the withdrawal for the validator, which will instantly increase the TVL by ~7.2ETH
+    //      3. Requests a withdrawal with all of the LRTTokens 
+    {
+        //1. Deposits 40ETH and receives ~40e18 LRTTokens
+        vm.startPrank(bob);
+        reETH.coordinator.depositETH{value: bobInitialBalance}();
+
+        //2. Cliam the withdrawal for the validator, which will instantly increase the TVL by ~7.2ETH
+        uint256 TVLBefore = reETH.assetRegistry.getTVL();
+        delayedWithdrawalRouter.claimDelayedWithdrawals(address(operatorDelegator), 1); 
+        uint256 TVLAfter = reETH.assetRegistry.getTVL();
+
+        //->TVL increased by 7.2ETH
+        assertEq(TVLAfter - TVLBefore, 7.2e18);
+
+        //3. Requests a withdrawal with all of the LRTTokens 
+        reETH.coordinator.requestWithdrawal(ETH_ADDRESS, reETH.token.balanceOf(bob));
+        vm.stopPrank();
+    }
+    
+    //-> Wait and rebalance
+    skip(reETH.coordinator.rebalanceDelay());
+    vm.prank(EOA, EOA);
+    reETH.coordinator.rebalance(ETH_ADDRESS);
+
+    //-> Bob withdraws the funds he requested
+    vm.prank(bob);
+    reETH.withdrawalQueue.claimWithdrawalsForEpoch(IRioLRTWithdrawalQueue.ClaimRequest({asset: ETH_ADDRESS, epoch: 0}));
+
+    //-> Bob has stole ~50% of the rewards and has 3.59ETH more than he initially started with
+    assertGt(bob.balance, bobInitialBalance);
+    assertEq(bob.balance - bobInitialBalance, 3599550056000000000);
+}
+```
+
+## Impact
+Rewards can be stolen by sandwiching the call to [EigenLayer::DelayedWithdrawalRouter::claimDelayedWithdrawals()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/DelayedWithdrawalRouter.sol#L99), however this requires a bigger investment in funds the higher the protocol TVL.
+
+## Code Snippet
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+When requesting withdrawals via [RioLRTCoordinator::requestWithdrawal()](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/restaking/RioLRTCoordinator.sol#L99) don't distribute the rewards received in the current epoch.
+
+
+
+## Discussion
+
+**KupiaSecAdmin**
+
+Escalate
+
+This should be considered as Invalid.
+The logic is pretty natural and this sandwiching can not be considered as attack.
+`claimDelayedWithdrawals` should be called at some point by anyone, and minting transactions come before the claim transaction and requestWithdrawal transactions come after claim transaction is natural logic.
+
+**sherlock-admin2**
+
+> Escalate
+> 
+> This should be considered as Invalid.
+> The logic is pretty natural and this sandwiching can not be considered as attack.
+> `claimDelayedWithdrawals` should be called at some point by anyone, and minting transactions come before the claim transaction and requestWithdrawal transactions come after claim transaction is natural logic.
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**0xcats**
+
+> Escalate
+> 
+> This should be considered as Invalid. The logic is pretty natural and this sandwiching can not be considered as attack. `claimDelayedWithdrawals` should be called at some point by anyone, and minting transactions come before the claim transaction and requestWithdrawal transactions come after claim transaction is natural logic.
+
+You can take a look at my issue of #22.
+
+I don't really understand how you can say this is natural and that sandwiching is not considered an attack? Honest users have absolutely no incentive to stake their funds for continuous periods of time if anyone can just come and front-run reward distribution and steal rewards.
+
+**nevillehuang**
+
+I'm also unsure how this is considered normal logic unless otherwise stated as an known risk, which is not. Any user diluting rewards/stealing rewards seems fair to be valid to me.
+
+**Czar102**
+
+I agree with @0xcats and @nevillehuang. Planning to reject the escalation and leave the issue as is.
+
+**Czar102**
+
+Result:
+Medium
+Has duplicates
+
+**sherlock-admin3**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [KupiaSecAdmin](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/52/#issuecomment-2022992949): rejected
+
+# Issue M-4: Execution Layer rewards are lost 
+
+Source: https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/174 
+
+## Found by 
+fnanni
+## Summary
+
+According to Rio Network Docs: "The Reward Distributor contract ([RioLRTRewardDistributor](https://github.com/contracts-and-tooling/source-code/restaking/riolrtrewarddistributor)) has the ability to [receive](https://github.com/contracts-and-tooling/source-code/restaking/riolrtrewarddistributor#receive) ETH via the Ethereum Execution Layer or EigenPod rewards and then distribute those rewards". However, this is only true for EigenPod rewards. Execution Layer rewards are not accounted for and lost.
+
+## Vulnerability Detail
+
+Execution Layer rewards are not distributed through plain ETH transfers. Instead the balance of the block proposer fee recipient's address is directly updated. If the fee recipient getting the EL rewards is a smart contract, this means that the fallback/receive function is not called. Actually, a smart contract could receive EL rewards even if these functions are not defined.
+
+The [RioLRTRewardDistributor](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTRewardDistributor.sol) contract relies solely on its [receive](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTRewardDistributor.sol#L82-L94) function to distribute rewards. EL rewards which don't trigger this function are not accounted in the smart contract and there is no way of distributing them.
+
+## Impact
+
+Execution Layer rewards are lost.
+
+## Code Snippet
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+
+Add a method to manually distribute EL rewards. For example:
+
+```solidity
+    function distributeRemainingBalance() external {
+        uint256 value = address(this).balance;
+
+        uint256 treasuryShare = value * treasuryETHValidatorRewardShareBPS / MAX_BPS;
+        uint256 operatorShare = value * operatorETHValidatorRewardShareBPS / MAX_BPS;
+        uint256 poolShare = value - treasuryShare - operatorShare;
+
+        if (treasuryShare > 0) treasury.transferETH(treasuryShare);
+        if (operatorShare > 0) operatorRewardPool.transferETH(operatorShare);
+        if (poolShare > 0) address(depositPool()).transferETH(poolShare);
+
+        emit ETHValidatorRewardsDistributed(treasuryShare, operatorShare, poolShare);
+    }
+```
+
+
+
+## Discussion
+
+**nevillehuang**
+
+request poc
+
+I need more information/resources for this issue so need to facilitate discussion.
+
+**sherlock-admin3**
+
+PoC requested from @fnanni-0
+
+Requests remaining: **6**
+
+**fnanni-0**
+
+@nevillehuang I forgot to link to the Rio docs: https://docs.rio.network/rio-architecture/deposits-and-withdraws/reward-distributor. Can we get @solimander input here? Reading this issue again, there is a chance I misunderstood the docs. Is the Reward Distributor contract expected to be able to receive Execution Layer rewards, i.e. be set as blocks fee_recipient address?
+
+#### If the answer is yes:
+
+From the [Solidity docs](https://docs.soliditylang.org/en/latest/contracts.html#receive-ether-function): "A contract without a receive Ether function can receive Ether as a recipient of a coinbase transaction". The recipient of a coinbase transaction post-merge is the address defined by the block proposer in the `fee_recipient` field of the [Execution Payload](https://github.com/ethereum/consensus-specs/blob/dev/specs/bellatrix/beacon-chain.md#executionpayload). According to https://eth2book.info/capella/annotated-spec/ : 
+
+> fee_recipient is the Ethereum account address that will receive the unburnt portion of the transaction fees (the priority fees). This has been called various things at various times: the original Yellow Paper calls it beneficiary; [EIP-1559](https://eips.ethereum.org/EIPS/eip-1559) calls it author. In any case, the proposer of the block sets the fee_recipient to specify where the appropriate transaction fees for the block are to be sent. Under proof of work this was the same address as the COINBASE address that received the block reward. Under proof of stake, the block reward is credited to the validator's beacon chain balance, and **the transaction fees are credited to the fee_recipient Ethereum address**.
+
+As an example go to etherscan and select any block recently produced. Check the fee recipient address. Check how its ETH balance is updated ("credited") at every transaction included in the block even though there is no explicit transaction to the fee recipient address (for example, balance update of beaverbuild [here](https://etherscan.io/tx/0xd6460ce006ff7d88d361fd2b08555e5e033208c187a16407f3a3bff304dd982d#statechange)).
+
+**solimander**
+
+Our operators will run MEV-Boost, which sets the fee recipient to the builder, who then transfers rewards to the proposer, which triggers the receive function.
+
+However, it seems worth adding a function to manually push rewards just in case. How does that affect severity here?
+
+**fnanni-0**
+
+@solimander I have a few questions:
+
+1. If mev-boost isn't available for a given block (for example there's a timeout), doesn't mev-boost fallback to a validator's local block proposal? See [this comment](https://github.com/flashbots/mev-boost/issues/222#issuecomment-1202401149) about Teku's client for instance (or Teku's [docs](https://docs.teku.consensys.io/concepts/builder-network#mev-boost)). In such case, fee_recipient would be the proposer address, not the builder's address.
+2. The flow you described is the current standarized payment method for mev-boost. I wonder if this could change or if there are other builder networks handling this differently. If so, I think it's risky to assume that the proposer address will always receive rewards through direct transfers.
+3. Isn't it likely that Ethereum upgrades in the future to better support Proposer-Builder Separation? If this happens, there's a chance the proposer address gets credited, not triggering the receive function.
+
+**solimander**
+
+> If mev-boost isn't available for a given block (for example there's a timeout), doesn't mev-boost fallback to a validator's local block proposal? See https://github.com/flashbots/mev-boost/issues/222#issuecomment-1202401149 about Teku's client for instance (or Teku's [docs](https://docs.teku.consensys.io/concepts/builder-network#mev-boost)). In such case, fee_recipient would be the proposer address, not the builder's address.
+
+I'm unsure, but that'd make sense. I'll be adding a function to manually split and push rewards regardless.
+
+**nevillehuang**
+
+This issue seems out of scope and hinges on external admin integrations. But leaving open for escalation period
+
+**sherlock-admin4**
+
+The protocol team fixed this issue in PR/commit https://github.com/rio-org/rio-sherlock-audit/pull/6.
+
+**10xhash**
+
+Escalate
+
+The info that the RioLRTRewardDistributor is meant to receive the execution layer rewards is not mentioned anywhere. The mentioned docs state `The Reward Distributor contract (RioLRTRewardDistributor) has the ability to receive ETH via the Ethereum Execution Layer or EigenPod rewards and then distribute those rewards`, which only indicates that the RioLRTRewardDistributor should be able to receive ETH which it does. 
+
+**sherlock-admin2**
+
+> Escalate
+> 
+> The info that the RioLRTRewardDistributor is meant to receive the execution layer rewards is not mentioned anywhere. The mentioned docs state `The Reward Distributor contract (RioLRTRewardDistributor) has the ability to receive ETH via the Ethereum Execution Layer or EigenPod rewards and then distribute those rewards`, which only indicates that the RioLRTRewardDistributor should be able to receive ETH which it does. 
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**fnanni-0**
+
+I disagree. The Reward Distributor is expected to receive and distribute rewards. “the ability to receive ETH via the Ethereum Execution Layer or EigenPod rewards”, in this context, seems to mean Execution Layer rewards, which the sponsor confirmed. EL rewards are credited, not transferred, and therefore cannot be currently distributed.
+
+Following up on the prior discussion with the sponsor, regarding operators' obligation to use mev-boost: builders replace the proposer's fee recipient address with their own and directly transfer funds to the former, triggering the receive function. mev-boost is not mentioned in Rio’s docs, but still EL rewards will sometimes be lost:
+
+1. if the builder network becomes unavailable through the configured relays for whatever reason, validator clients fallback to local block production in order to avoid missing a block proposal.
+1. mev-boost accepts a minimum bid parameter (see [this](https://github.com/flashbots/mev-boost/pull/274) and [this](https://github.com/flashbots/mev-boost?tab=readme-ov-file#setting-a-minimum-bid-value-with--min-bid)). If set, the process will fallback to local block production every time bids from the builder network don’t surpass this threshold.
+1. clients give the option to fallback to local block production when the builder bid represents less than X% of the locally produced block profits. See for example Teku [builder-bid-compare-factor](https://docs.teku.consensys.io/reference/cli#builder-bid-compare-factor), Lighthouse [builder-boost-factor](https://lighthouse-book.sigmaprime.io/builders.html#how-to-connect-to-a-builder) or Prysm [local-block-value-boost](https://docs.prylabs.network/docs/advanced/builder#prioritizing-local-blocks). 
+
+For operators aiming for optimal performance, settings 1, 2, and 3 are crucial. RioLRTRewardDistributor assumes the fee recipient role in these instances, causing priority fees and MEV funds to get stuck.
+
+**solimander**
+
+We only mention MEV-Boost in [our operator docs](https://docs-operators.rio.network/post-approval-requirements#mev-boost).
+
+Valid in that execution layer rewards would be stuck in the fallback case.
+
+**nevillehuang**
+
+I believe @10xhash is correct, this seems to be out of scope and invalid based on the following sherlock [rule](https://docs.sherlock.xyz/audits/judging/judging#vii.-list-of-issue-categories-that-are-not-considered-valid) unless otherwise stated in documentation, which is not present.
+
+> 14. Loss of airdrops or liquidity fees or any other rewards that are not part of the original protocol design is not considered a valid high/medium. [Example](https://github.com/sherlock-audit/2023-02-openq-judging/issues/323)
+
+**fnanni-0**
+
+@nevillehuang could you elaborate on why do you consider EL rewards sent to RioLRTRewardDistributor `rewards that are not part of the original protocol design`?
+
+The documentation ([here](https://docs.rio.network/rio-architecture/deposits-and-withdraws/reward-distributor) and [here](https://docs.rio.network/rio-network/liquid-restaking-tokens/rewards)) mentions that EL rewards are expected and RioLRTRewardDistributor must handle them. In addition, it is stated in the [operators docs](https://docs-operators.rio.network/post-approval-requirements#mev-boost) that whitelisted operators must make sure this happens (otherwise I guess the RioDAO would delist operators who disobey?). Third, go to the FAQs section in https://goerli.rio.network/ and you will see: 
+
+> ### How often do rewards compound/turnover?
+> Restaking [rewards](https://docs.rio.network/rio-network/liquid-restaking-tokens/rewards) (less fees) are [deposited](https://docs.rio.network/rio-architecture/deposits-and-withdraws#deposit-workflow) into the LRT’s deposit pool when the [daily epoch ends](https://docs.rio.network/rio-architecture/deposits-and-withdraws/deposit-pool-rebalancer). These rewards are based on the Ethereum consensus layer -->**and the execution layer rewards**<--.
+
+Furthermore, rewards expected to be received by RioLRTRewardDistributor (EL rewards included) [are distributed to the treasury, the operatorRewardPool and the depositPool](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTRewardDistributor.sol#L89-L91). This means that EL rewards become:
+
+1. profit for RioDAO.
+2. profit for operators.
+3. yield for the Rio protocol and potentially financial source of new validators that will allow even more yield into Rio. This seems like an important feature and incentive for users staking in Rio.
+
+There are many places in which it is explicitly or implicitly pointed at the fact that Execution Layer rewards are part of Rio's protocol rewards and the sponsor confirmed this. 
+
+**nevillehuang**
+
+@fnanni-0 You are correct, thanks for pointing me to the right resource. I believe this issue is valid and should remain as it is.
+
+**Czar102**
+
+I believe that Execution Layer rewards are a part of the initial design, but I don't see why would the `RioLRTRewardDistributor` be thought to be able to receive these rewards directly. I will quote the same source as above:
+> Restaking [rewards](https://docs.rio.network/rio-network/liquid-restaking-tokens/rewards) (less fees) are [**deposited**](https://docs.rio.network/rio-architecture/deposits-and-withdraws#deposit-workflow) into the LRT’s deposit pool when the [daily epoch ends](https://docs.rio.network/rio-architecture/deposits-and-withdraws/deposit-pool-rebalancer). These rewards are based on the Ethereum consensus layer and the execution layer rewards.
+
+Please note that a word "depositing" is used, which implies that the deposit logic is triggered during these operations, and the balance isn't just incremented.
+
+Aside from that, the MEV Bosst is [mentioned in the docs](https://docs.rio.network/rio-network/liquid-restaking-tokens/rewards#execution-layer-rewards):
+> To obtain the Maximal Extractable Value (MEV) from a block, the block builder can choose to auction block space to block builders in a competitive marketplace with software like MEV boost, further increasing potential rewards. 
+
+In order to keep this issue valid, there needs to be an expectation of `RioLRTRewardDistributor` to receive the Execution Layer rewards directly. @fnanni-0 can you let me know where is it communicated?
+
+**nevillehuang**
+
+@Czar102 Agree with your reasoning, I think it was not explicitly stated that execution layer rewards are expected to be received directly, as mentioned [here](https://discord.com/channels/812037309376495636/1209514827442167839/1213518776583331901)
+
+**fnanni-0**
+
+@Czar102 I think [this](https://docs-operators.rio.network/post-approval-requirements#execution-layer-rewards-configuration) is where it's the clearest. The Reward Distributor contract is mentioned and the instruction to set it as the fee recipient means that it is expected to receive execution layer rewards directly. 
+
+> ## Post-Approval Requirements
+> Once approved by the RioDAO, please complete the following steps:
+> ### Ethereum Validators
+> #### Execution Layer Rewards Configuration
+> Set the fee recipient for your validators to the Reward Distributor contract. This is NOT the same as the [Withdrawal Credentials](https://docs-operators.rio.network/validator-keys#withdrawal-credentials) address.
+
+Note that even with mev-boost as a requirement (which the docs don't seem to say it's a must), setting fee recipient to the Reward Distributor contract means that in fallback cases it will receive EL rewards directly, as explain in my previous [comment](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/174#issuecomment-2025915385).
+
+In case it matters, the documentation provided in the contest readme (https://docs.rio.network/) references the operator docs, quoted above, in the section `CONTRACTS AND TOOLING` --> `Tooling` --> `Rio Operator Guide`.
+
+Regarding,
+
+> but I don't see why would the `RioLRTRewardDistributor` be thought to be able to receive these rewards directly
+
+I guess the operator docs are enough, but let me elaborate a bit more. EigenLayer doesn't handle execution layer rewards, so it's evident that they must be handled differently. There are no other contracts in Rio protocol for this purpose except for RioLRTRewardDistributor and nowhere it is explained that there could be a special method for handling EL rewards before sending them to RioLRTRewardDistributor. The most straight forward, intuitive way is to simply send the rewards directly. 
+
+Here are all the other chunks of documentation and comments linked in this discussion that seem to me to clearly state that EL rewards are or could be received directly by the `RioLRTRewardDistributor`:
+
+> The Reward Distributor contract ([RioLRTRewardDistributor](https://docs.rio.network/contracts-and-tooling/source-code/restaking/riolrtrewarddistributor)) has the ability to [receive](https://docs.rio.network/contracts-and-tooling/source-code/restaking/riolrtrewarddistributor#receive) ETH via the Ethereum Execution Layer or EigenPod rewards and then distribute those rewards.
+
+> ETH staking consensus rewards are claimed from EigenPods [...]. ETH staking execution rewards flow directly through the reward distributor. 
+
+> ## Rewards
+> Participating in restaking generates rewards in a number of forms outlined below. When rewards are received by the [RewardDistributor](https://docs.rio.network/contracts-and-tooling/source-code/restaking/riolrtrewarddistributor) contract in a form other than ETH, [...].
+> ### EigenLayer Rewards and EigenLayer Points
+> [...]
+> ### Native Staking Rewards
+> [...]
+> #### Consensus Layer Rewards
+> [...]
+> #### --> Execution Layer Rewards <--
+> [...]
+
+> Restaking [rewards](https://docs.rio.network/rio-network/liquid-restaking-tokens/rewards) [quoted above] (less fees) are [deposited](https://docs.rio.network/rio-architecture/deposits-and-withdraws#deposit-workflow) into the LRT’s deposit pool when the [daily epoch ends](https://docs.rio.network/rio-architecture/deposits-and-withdraws/deposit-pool-rebalancer). These rewards are based on the Ethereum consensus layer and the execution layer rewards.
+
+Regarding the last quote, you wrote: 
+
+> Please note that a word "depositing" is used, which implies that the deposit logic is triggered during these operations, and the balance isn't just incremented.
+
+You are right in the sense that the deposit logic is referenced, but I think the link might be incorrect. "deposited when the daily epoch ends" is contradictory, since the deposit flow and the rebalance flow are two separate things. But "depositing" is use in the context of the Deposit Pool contract receiving rewards which is well documented, because the Reward Distributor contract sends ETH to it which can be withdrawn/staked during rebalancing.
+
+**Czar102**
+
+Great points, @fnanni-0.
+
+@nevillehuang I think the message you quoted actually supports @fnanni-0's point, am I understanding correctly?
+> ETH staking execution rewards flow directly through the reward distributor.
+
+@fnanni-0 does Rio have control over when the Execution Layer Rewards are sent if they are sent directly? I think lack of my knowledge about it didn't allow me to fully understand the meaning of the last quote from the docs about daily deposits of rewards.
+
+**fnanni-0**
+
+> @fnanni-0 does Rio have control over when the Execution Layer Rewards are sent if they are sent directly?
+
+@Czar102 I don't think so. They are sent to the Reward Distributor directly when a validator controlled by an operator registered in Rio is selected as block proposer and one of [these three scenarios](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/174#issuecomment-2025915385) happens (or if mev-boost is not used). Does this answer your question?
+
+> about daily deposits of rewards
+
+In case it wasn't clear, the Deposit Pool should receive the rewards from the Reward Distributor at any time, independently of the rebalance execution, like all deposits. It's the rebalancing of these deposits (rewards included) that happens daily. Anyway, this doesn't seem very relevant here.
+
+
+**Czar102**
+
+I see, thank you for this elaboration. It seems that this is indeed a valid concern.
+
+@solimander @nevillehuang @10xhash @mstpr if you still diagree, please elaborate what are we misunderstanding.
+
+Planning to reject the escalation and leave the issue as is.
+
+**Czar102**
+
+Result:
+Medium
+Unique
+
+**sherlock-admin3**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [10xhash](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/174/#issuecomment-2024334137): rejected
+
+# Issue M-5: The protocol can't receive rewards because of low gas limits on ETH transfers 
+
+Source: https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/185 
+
+## Found by 
+0xkaden, Anubis, MatricksDeCoder, Topmark, Tricko, boredpukar, cats, deth, fnanni, hash, klaus, popular, sakshamguruji, zzykxx
+## Summary
+The hardcoded gas limit of the [Asset::transferETH()](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/utils/Asset.sol#L41-L46) function, used to transfer ETH in the protocol, is too low and will result unwanted reverts.
+
+## Vulnerability Detail
+ETH transfers in the protocol are always done via [Asset::transferETH()](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/utils/Asset.sol#L41-L46), which performs a low-level call with an hardcoded gas limit of `10_000`:
+```solidity
+(bool success,) = recipient.call{value: amount, gas: 10_000}('');
+if (!success) {revert ETH_TRANSFER_FAILED();}
+```
+
+The hardcoded `10_000` gas limit is not high enough for the protocol to be able receive and distribute rewards. Rewards are currently only available for native ETH, an are received by Rio via:
+- Partial withdrawals
+- ETH in excess of `32ETH` on full withdrawals
+
+The flow to receive rewards requires two steps:
+1. An initial call to [EigenPod::verifyAndProcessWithdrawals()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L232), which queues a withdrawal to the Eigenpod owner: an `RioLRTOperatorDelegator` instance
+2. A call to [DelayedWithdrawalRouter::claimDelayedWithdrawals()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/DelayedWithdrawalRouter.sol#L99).
+
+The call to [DelayedWithdrawalRouter::claimDelayedWithdrawals()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/DelayedWithdrawalRouter.sol#L99) triggers the following flow:
+1. ETH are transferred to the [RioLRTOperatorDelegator](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/restaking/RioLRTOperatorDelegator.sol#L244-L246) instance, where the `receive()` function is triggered.
+2. The `receive()` function of [RioLRTOperatorDelegator](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/restaking/RioLRTOperatorDelegator.sol#L244-L246) transfers ETH via [Asset::transferETH()](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/utils/Asset.sol#L41-L46) to the [RioLRTRewardDistributor](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/restaking/RioLRTRewardDistributor.sol#L82-L94), where another `receive()` function is triggered.
+3. The `receive()` function of [RioLRTRewardDistributor](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/restaking/RioLRTRewardDistributor.sol#L82-L94) transfers ETH via [Asset::transferETH()](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/utils/Asset.sol#L41-L46) to the `treasury`, the `operatorRewardPool` and the [`RioLRTDepositPool`](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/restaking/RioLRTDepositPool.sol).
+
+The gas is limited at `10_000` in step `2` and is not enough to perform step `3`, making it impossible for the protocol to receive rewards and leaving funds stuck.
+
+### POC
+Add the following imports to `RioLRTOperatorDelegator.t.sol`:
+```solidity
+import {IRioLRTOperatorRegistry} from 'contracts/interfaces/IRioLRTOperatorRegistry.sol';
+import {RioLRTOperatorDelegator} from 'contracts/restaking/RioLRTOperatorDelegator.sol';
+import {CredentialsProofs, BeaconWithdrawal} from 'test/utils/beacon-chain/MockBeaconChain.sol';
+```
+
+then copy-paste:
+```solidity
+function test_outOfGasOnRewards() public {
+    address alice = makeAddr("alice");
+    uint256 initialBalance = 40e18;
+    deal(alice, initialBalance);
+    vm.prank(alice);
+    reETH.token.approve(address(reETH.coordinator), type(uint256).max);
+
+    //->Operator delegator and validators are added to the protocol
+    uint8 operatorId = addOperatorDelegator(reETH.operatorRegistry, address(reETH.rewardDistributor));
+    RioLRTOperatorDelegator operatorDelegator =
+        RioLRTOperatorDelegator(payable(reETH.operatorRegistry.getOperatorDetails(operatorId).delegator));
+
+    //-> Alice deposits ETH in the protocol
+    vm.prank(alice);
+    reETH.coordinator.depositETH{value: initialBalance}();
+    
+    //-> Rebalance is called and the ETH deposited in a validator
+    vm.prank(EOA, EOA);
+    reETH.coordinator.rebalance(ETH_ADDRESS);
+
+    //-> Create a new validator with a 40ETH balance and verify his credentials.
+    //-> This is to "simulate" rewards accumulation
+    uint40[] memory validatorIndices = new uint40[](1);
+    IRioLRTOperatorRegistry.OperatorPublicDetails memory details = reETH.operatorRegistry.getOperatorDetails(operatorId);
+    bytes32 withdrawalCredentials = operatorDelegator.withdrawalCredentials();
+    beaconChain.setNextTimestamp(block.timestamp);
+    CredentialsProofs memory proofs;
+    (validatorIndices[0], proofs) = beaconChain.newValidator({
+        balanceWei: 40 ether,
+        withdrawalCreds: abi.encodePacked(withdrawalCredentials)
+    });
+    
+    //-> Verify withdrawal crendetials
+    vm.prank(details.manager);
+    reETH.operatorRegistry.verifyWithdrawalCredentials(
+        operatorId,
+        proofs.oracleTimestamp,
+        proofs.stateRootProof,
+        proofs.validatorIndices,
+        proofs.validatorFieldsProofs,
+        proofs.validatorFields
+    );
+
+    //-> Process a full withdrawal, 8ETH (40ETH - 32ETH) will be queued withdrawal as "rewards"
+    verifyAndProcessWithdrawalsForValidatorIndexes(address(operatorDelegator), validatorIndices);
+
+    //-> Call `claimDelayedWithdrawals` to claim the withdrawal
+    delayedWithdrawalRouter.claimDelayedWithdrawals(address(operatorDelegator), 1); //❌ Reverts for out-of-gas
+}
+```
+## Impact
+The protocol is unable to receive rewards and the funds will be stucked.
+
+## Code Snippet
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+Remove the hardcoded `10_000` gas limit in [Asset::transferETH()](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/utils/Asset.sol#L41-L46), at least on ETH transfers where the destination is a protocol controlled contract.
+
+
+
+## Discussion
+
+**sherlock-admin4**
+
+The protocol team fixed this issue in PR/commit https://github.com/rio-org/rio-sherlock-audit/pull/4.
+
+# Issue M-6: RioLRTIssuer::issueLRT reverts if deposit asset's approve method doesn't return a bool 
+
+Source: https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/189 
+
+## Found by 
+fibonacci, fugazzi
+## Summary
+
+Using `ERC20::approve` will not work with ERC20 tokens that do not return a bool.
+
+## Vulnerability Detail
+
+The contest's README states that tokens that may not return a bool on ERC20 methods (e.g., USDT) are supposed to be used.
+
+The `RioLRTIssuer::issueLRT` function makes a sacrificial deposit to prevent inflation attacks. To process the deposit, it calls the `ERC20::approve` method, which is expected to return a bool value.
+
+Solidity has return data length checks, and if the token implementation does not return a bool value, the transaction will revert.
+
+## Impact
+
+Issuing LRT tokens with an initial deposit in an asset that does not return a bool on an `approve` call will fail.
+
+## POC
+
+Add this file to the `test` folder. Run test with `forge test --mc POC --rpc-url=<mainnet-rpc-url> -vv`.
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.23;
+
+import {Test, console2} from 'forge-std/Test.sol';
+import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
+import {SafeERC20} from '@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol';
+
+contract POC is Test {
+    address constant USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
+    address immutable owner = makeAddr("owner");
+    address immutable spender = makeAddr("spender");
+
+    function setUp() external {
+       deal(USDT, owner, 1e6);
+    }
+
+    function testApproveRevert() external {
+        vm.prank(owner);
+        IERC20(USDT).approve(spender, 1e6);
+    }
+
+    function testApproveSuccess() external {
+        vm.prank(owner);
+        SafeERC20.forceApprove(IERC20(USDT), spender, 1e6);
+
+        uint256 allowance = IERC20(USDT).allowance(owner, spender);
+        assertEq(allowance, 1e6);
+    }
+}
+```
+
+## Code Snippet
+
+https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/restaking/RioLRTIssuer.sol#L172
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+
+Use `forceApprove` from OpenZeppelin's `SafeERC20` library.
+
+
+
+## Discussion
+
+**sherlock-admin4**
+
+The protocol team fixed this issue in PR/commit https://github.com/rio-org/rio-sherlock-audit/pull/5.
+
+**mstpr**
+
+Escalate
+I think this issue is low/informational for the following reasons:
+
+1- There are no loss of funds here. If the USDT is picked then the underlying asset will not be possible to be added to LRT. 
+
+2- Current code is specifically for assets that has an EigenLayer strategy which there are no tokens like USDT. 
+
+3- Issuer contract is upgradable proxy, if the adding a new asset fails, then the new implementation can be used to add the asset to LRT.
+
+**sherlock-admin2**
+
+> Escalate
+> I think this issue is low/informational for the following reasons:
+> 
+> 1- There are no loss of funds here. If the USDT is picked then the underlying asset will not be possible to be added to LRT. 
+> 
+> 2- Current code is specifically for assets that has an EigenLayer strategy which there are no tokens like USDT. 
+> 
+> 3- Issuer contract is upgradable proxy, if the adding a new asset fails, then the new implementation can be used to add the asset to LRT.
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**nevillehuang**
+
+Disagree with escalation, the argument is moot given it is explicitly stated in contest details that such tokens could be supported
+
+> Do you expect to use any of the following tokens with non-standard behaviour with the smart contracts?
+
+> - We plan to support tokens with no less than 6 decimals and no more than 18 decimals.
+> - Tokens may not return a bool on ERC20 methods (e.g. USDT)
+> - Tokens may have approval race protections (e.g. USDT)
+
+**realfugazzi**
+
+> Escalate I think this issue is low/informational for the following reasons:
+> 
+> 1- There are no loss of funds here. If the USDT is picked then the underlying asset will not be possible to be added to LRT.
+> 
+> 2- Current code is specifically for assets that has an EigenLayer strategy which there are no tokens like USDT.
+> 
+> 3- Issuer contract is upgradable proxy, if the adding a new asset fails, then the new implementation can be used to add the asset to LRT.
+
+USDT is mentioned as a supported asset in the documentation, also double checked by the sponsor, see #232 
+
+The issue will prevent the initial deposit, enabling inflation attack vectors. 
+
+**solimander**
+
+> The issue will prevent the initial deposit, enabling inflation attack vectors.
+
+It will not allow USDT to be added, rather than enable inflation attack vectors.
+
+**Czar102**
+
+I disagree with the escalation, the codebase will not be able to support planned functionality without loss of funds, so Medium is appropriate.
+
+**mstpr**
+
+> I disagree with the escalation, the codebase will not be able to support planned functionality without loss of funds, so Medium is appropriate.
+
+there won't be any loss of funds tho. It is just simply USDT will not be added, tx will fail. 
+
+**solimander**
+
+In which case, the issuer would be upgraded to support USDT.
+
+**realfugazzi**
+
+> > I disagree with the escalation, the codebase will not be able to support planned functionality without loss of funds, so Medium is appropriate.
+> 
+> there won't be any loss of funds tho. It is just simply USDT will not be added, tx will fail.
+
+right even setting 0 will break the tx, but it falls in the med severity according to the docs as core func is broken 
+
+**Czar102**
+
+Result:
+Medium
+Has duplicates
+
+As noted above, breaks core functionality, hence Medium is appropriate.
+
+**sherlock-admin3**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [mstpr](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/189/#issuecomment-2022687170): rejected
+
+# Issue M-7: Stakers can avoid validator penalties 
+
+Source: https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/190 
+
+## Found by 
+monrel, zzykxx
+## Summary
+Stakers can frontrun validators penalties and slashing events with a withdrawal request in order to avoid the loss, this is possible if the deposit pool has enough liquidity available.
+
+## Vulnerability Detail
+Validators can lose part of their deposit via [penalties](https://eth2book.info/capella/part2/incentives/penalties/) or [slashing](https://eth2book.info/capella/part2/incentives/slashing/) events:
+- In case of penalties Eigenlayer can be notified of the balance drop via the permissionless function 
+[EigenPod::verifyBalanceUpdates()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L185). 
+- In case of slashing the validator is forced to exit and Eigenlayer can be notified via the permissionless function [EigenPod::verifyAndProcessWithdrawals()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L232) because the slashing event is effectively a full withdrawal.
+
+As soon as either [EigenPod::verifyBalanceUpdates()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L185) or [EigenPod::verifyAndProcessWithdrawals()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L232) is called the TVL of the Rio protocol drops instantly. This is because both of the functions update the variable [`podOwnerShares[podOwner]`](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPodManager.sol#L120):
+- [EigenPod::verifyBalanceUpdates()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L185) will update the variable [here](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L220)
+- [EigenPod::verifyAndProcessWithdrawals()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L232) will update the variable [here](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L275)
+
+This makes it possible for stakers to:
+1. Request a withdrawal via [RioLRTCoordinator::rebalance()](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/restaking/RioLRTCoordinator.sol#L99) for all the `LRTTokens` held.
+2. Call either [EigenPod::verifyBalanceUpdates()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L185) or [EigenPod::verifyAndProcessWithdrawals()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L232).
+
+At this point when [RioLRTCoordinator::rebalance()](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/restaking/RioLRTCoordinator.sol#L121) will be called and a withdrawal will be queued that does not include penalties or slashing. 
+
+It's possible to withdraw `LRTTokens` while avoiding penalties or slashing up to the amount of liquidity available in the deposit pool.
+
+### POC
+I wrote a POC whose main point is to show that requesting a withdrawal before an instant TVL drop will withdraw the full amount requested without taking the drop into account. The POC doesn't show that [EigenPod::verifyBalanceUpdates()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L185) or [EigenPod::verifyAndProcessWithdrawals()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L232) actually lowers the TVL because I wasn't able to implement it in the tests.
+
+Add imports to `RioLRTCoordinator.t.sol`:
+```solidity
+import {IRioLRTOperatorRegistry} from 'contracts/interfaces/IRioLRTOperatorRegistry.sol';
+import {RioLRTOperatorDelegator} from 'contracts/restaking/RioLRTOperatorDelegator.sol';
+import {CredentialsProofs, BeaconWithdrawal} from 'test/utils/beacon-chain/MockBeaconChain.sol';
+```
+
+then copy-paste:
+```solidity
+IRioLRTOperatorRegistry.StrategyShareCap[] public emptyStrategyShareCaps;
+function test_avoidInstantPriceDrop() public {
+    //-> Add two operators with 1 validator each
+    uint8[] memory operatorIds = addOperatorDelegators(
+        reETH.operatorRegistry,
+        address(reETH.rewardDistributor),
+        2,
+        emptyStrategyShareCaps,
+        1
+    );
+    address operatorAddress0 = address(uint160(1));
+
+    //-> Deposit ETH so there's 74ETH in the deposit pool
+    uint256 depositAmount = 2*ETH_DEPOSIT_SIZE - address(reETH.depositPool).balance;
+    uint256 amountToWithdraw = 10 ether;
+    reETH.coordinator.depositETH{value: amountToWithdraw + depositAmount}();
+
+    //-> Stake the 64ETH on the validators, 32ETH each and 10 ETH stay in the deposit pool
+    vm.prank(EOA, EOA);
+    reETH.coordinator.rebalance(ETH_ADDRESS);
+
+    //-> Attacker notices a validator is going receive penalties and immediately requests a withdrawal of 10ETH
+    reETH.coordinator.requestWithdrawal(ETH_ADDRESS, amountToWithdraw);
+
+    //-> Validator get some penalties and Eigenlayer notified 
+    //IMPORTANT: The following block of code it's a simulation of what would happen if a validator balances gets lowered because of penalties
+    //and `verifyBalanceUpdates()` gets called on Eigenlayer. It uses another bug to achieve an instant loss of TVL.
+
+    //      ~~~Start penalties simulation~~~
+    {
+        //-> Verify validators credentials of the two validators
+        verifyCredentialsForValidators(reETH.operatorRegistry, 1, 1);
+        verifyCredentialsForValidators(reETH.operatorRegistry, 2, 1);
+
+        //-> Cache current TVL and ETH Balance
+        uint256 TVLBefore = reETH.coordinator.getTVL();
+
+        //->Operator calls `undelegate()` on Eigenlayer
+        //IMPORTANT: This achieves the same a calling `verifyBalanceUpdates()` on Eigenlayer after a validator suffered penalties,
+        //an instant drop in TVL.
+        IRioLRTOperatorRegistry.OperatorPublicDetails memory details = reETH.operatorRegistry.getOperatorDetails(operatorIds[0]);
+        vm.prank(operatorAddress0);
+        delegationManager.undelegate(details.delegator);
+
+        //-> TVL dropped
+        uint256 TVLAfter = reETH.coordinator.getTVL();
+
+        assertLt(TVLAfter, TVLBefore);
+    }
+    //      ~~~End penalties simulation~~~
+
+    //-> Rebalance gets called
+    skip(reETH.coordinator.rebalanceDelay());
+    vm.prank(EOA, EOA);
+    reETH.coordinator.rebalance(ETH_ADDRESS);
+
+    //-> Attacker receives all of the ETH he withdrew, avoiding the effect of penalties
+    uint256 balanceBefore = address(this).balance;
+    reETH.withdrawalQueue.claimWithdrawalsForEpoch(IRioLRTWithdrawalQueue.ClaimRequest({asset: ETH_ADDRESS, epoch: 0}));
+    uint256 balanceAfter = address(this).balance;
+    assertEq(balanceAfter - balanceBefore, amountToWithdraw);
+}
+```
+
+## Impact
+Stakers can avoid validator penalties and slashing events if there's enough liquidity in the deposit pool.
+
+## Code Snippet
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+When [RioLRTCoordinator::rebalance()](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/restaking/RioLRTCoordinator.sol#L121) is called and penalties or slashing events happened during the epoch being settled, distribute the correct amount of penalties to all the `LRTTokens` withdrawn in the current epoch, including the ones that requested the withdrawal before the drop.
+
+
+
+## Discussion
+
+**nevillehuang**
+
+Could be related to #52 and duplicates, both seems to involve front-running/sandwiching rebalance calls. Separated for now for further discussions
+
+
+**solimander**
+
+Valid, though need to take some time to consider whether this will be addressed. Could potentially frontrun slashing using any liquidity pool.
+
+**KupiaSecAdmin**
+
+Escalate
+
+This issue should be considered as Low, because this happens under rare condition and impact is pretty small.
+1. When a staker notices a slashing event, tries to withdraw all of their assets, wait for rebalance delay, another wait for EigenLayer withdrawal period.
+2. The slashing amount is maximum 1ETH, compared to each validator deposits 32ETH, the amount does not affect TVL much.
+3. The penalty amount that staker can avoid is `Staker'sAmount * 1 / TVL`, which looks pretty small in real word experience, thus much less incentive for staker to monitor slashing events and avoid the penalty.
+4. Another point to consider is that once a staker requests a withdrawal, the staker loses earning during the withdrawal period, which makes it less incentive.
+
+
+**sherlock-admin2**
+
+> Escalate
+> 
+> This issue should be considered as Low, because this happens under rare condition and impact is pretty small.
+> 1. When a staker notices a slashing event, tries to withdraw all of their assets, wait for rebalance delay, another wait for EigenLayer withdrawal period.
+> 2. The slashing amount is maximum 1ETH, compared to each validator deposits 32ETH, the amount does not affect TVL much.
+> 3. The penalty amount that staker can avoid is `Staker'sAmount * 1 / TVL`, which looks pretty small in real word experience, thus much less incentive for staker to monitor slashing events and avoid the penalty.
+> 4. Another point to consider is that once a staker requests a withdrawal, the staker loses earning during the withdrawal period, which makes it less incentive.
+> 
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**0xmonrel**
+
+Escalate 
+
+I will argue that this is a High issue
+
+The core of this issue is not that TVL is dropped but rather that the slashing will be concentrated among those that don't front-run. 
+
+If 50% front-run then the rest will pay 50% more in slashing penalty. Taken to the worst case scenario, if all but 1 user front-run he will pay for the entire slashing amount. 
+
+Look at the duplicate #362 that shows this. 
+
+When this issue becomes known a new "meta" will be at play, everybody will have to front-run otherwise they risk losing all their funds since they will have to cover an outsized part of the slashing penalty. The most likely scenario is that users leave the protocol since there is no assurance they don't lose all their funds if other manage to front-run and they don't. 
+
+As such slashing does not actually have to happen for this to be an issue, when users known that this issue exists the rational decision is to exit the protocol.
+
+I am not sure if this fulfills the "Inflicts serious non-material losses (doesn't include contract simply not working)." requirement but I would like the judge to consider the above arguments.
+
+**sherlock-admin2**
+
+> Escalate 
+> 
+> I will argue that this is a High issue
+> 
+> The core of this issue is not that TVL is dropped but rather that the slashing will be concentrated among those that don't front-run. 
+> 
+> If 50% front-run then the rest will pay 50% more in slashing penalty. Taken to the worst case scenario, if all but 1 user front-run he will pay for the entire slashing amount. 
+> 
+> Look at the duplicate #362 that shows this. 
+> 
+> When this issue becomes known a new "meta" will be at play, everybody will have to front-run otherwise they risk losing all their funds since they will have to cover an outsized part of the slashing penalty. The most likely scenario is that users leave the protocol since there is no assurance they don't lose all their funds if other manage to front-run and they don't. 
+> 
+> As such slashing does not actually have to happen for this to be an issue, when users known that this issue exists the rational decision is to exit the protocol.
+> 
+> I am not sure if this fulfills the "Inflicts serious non-material losses (doesn't include contract simply not working)." requirement but I would like the judge to consider the above arguments.
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**Czar102**
+
+> When a staker notices a slashing event, tries to withdraw all of their assets, wait for rebalance delay, another wait for EigenLayer withdrawal period.
+
+@KupiaSecAdmin how long is the rebalance delay and the EigenLayer withdrawal period?
+
+> The slashing amount is maximum 1ETH, compared to each validator deposits 32ETH, the amount does not affect TVL much.
+
+There could be multiple slashings at once, right? So the amount isn't capped.
+cc @nevillehuang @0xmonrel 
+
+**KupiaSecAdmin**
+
+@Czar102 - Rebalance delay is max 3 days, EigenLayer's withdrawal period is about 5-7 days.
+
+Regarding the slashing, as it can be shown on beaconscan, usually 1-2(max 3-4) slashing happens in 12 days. And usually one slash amount is around 0.6 ETH, max capped at 1ETH.
+So they are 1-2 slashing of 1M validators, and in 12 days. Not sure how many validators can Rio could have control of, but the amount is relatively too small to incentivize stakers withdraw all their assets to avoid penalties.
+
+**0xmonrel**
+
+The point is that if other front-run you lose an unproportional amount if that is 1 ETH or 20 ETH [launchnode](https://blog.lido.fi/post-mortem-launchnodes-slashing-incident/) does not change the fact that the penalty is re-distributed. 
+
+Consider this from a user's perspective: They could based on the action of other LRT holders lose all their assets even based on a small % slashing. If something big happens such as the launchnode event the chance is of course increased.
+
+I believe this is a critical issue for an LRT or LST, each user having a guarantee that they only pay a proportional amount is a requirement for it to be a viable product. 
+
+As it stands: If slashed you could lose a proportional amount or up to 100% of your assets, you don't know. It will be a race to front-run.
+
+**KupiaSecAdmin**
+
+@0xmonrel - Talking about launchnode, they had about 5000 validators, so the staked amount is 160,000ETH.
+Saying 20ETH is slashed, it is like 0.0125%.
+Stakers withdrawing all assets because they want to avoid 0.01% of their asset does not seem to make much sense.
+
+Also not quite understanding what you've described above, how front-run can let other LRT holders lose all assets?
+
+**0xmonrel**
+
+Also the the following argument is not true:
+
+>When a staker notices a slashing event, tries to withdraw all of their assets, wait for rebalance delay, another >wait for EigenLayer withdrawal period.
+
+At the point when you front-run  withdrawal you have already calculated the exchange rate. Rebalancing does not have to happen before validator balance is updated on EigenLayer. You only need to call withdrawal on Rio which is where `sharesOwed` is calculated.
+
+This issue actually makes it seem like there are other constraints, that is not true. Look at my duplicate issue #362. You only need request withdrawl to lock in your `sharesOwed`.
+
+**0xmonrel**
+
+> @0xmonrel - Talking about launchnode, they had about 5000 validators, so the staked amount is 160,000ETH. Saying 20ETH is slashed, it is like 0.0125%. Stakers withdrawing all assets because they want to avoid 0.01% of their asset does not seem to make much sense.
+> 
+> Also not quite understanding what you've described above, how front-run can let other LRT holders lose all assets?
+
+I linked that to answer Czar question of multiple slashing being possible, which it is. 
+
+I will explain again that this issue leads to re-distribution of slashing, that is why you can lose 100%. 
+
+Simple Example:
+
+1. 1 ETH slashed
+2. All front-run other than 1 user that has shares worth 1 ETH. shares on EigenLayer=1.
+3. When balance is updated on Eigenlayer it will be 0 ETH since 1-1=0
+4. Last user has lost 100% of assets.
+
+Observe that all withdrawals for users in 2 will be successful at the `sharesOwed` calculated when they request their withdrawal since no deficit is reached.
+
+Its the re-distribution from all that front-run to those that are left that leads to large losses. 
+
+**Czar102**
+
+I believe that, given the sole requirement that a larger than usual (still, possibly small) slashing event needs to happen for this strategy of withdrawing to be profitable (lowering losses), the severity is High. It's quite close to being a Medium, though.
+
+Planning to accept the second escalation and make this a High severity issue.
+
+**nevillehuang**
+
+@Czar102 @solimander @0xmonrel Isn't slashing a less common event given validators are not incentivized to do so?
+
+**solimander**
+
+> Isn't slashing a less common event given validators are not incentivized to do so?
+
+It's an edge case. Only about 0.0425% of Ethereum validators have been slashed and we're working with professional operators, but it should be handled gracefully regardless.
+
+**0xmonrel**
+
+I think we should also consider that a small amount of slashing and profit for front-runners can still lead to very large loss for those that do not front-run.
+
+Here is a POC of a case where 1 ETH slashing leads to 100% loss for those that do not front-run.
+
+```solidity
+    function test_FrontRunReDistribution() public{
+        
+        uint8[] memory operatorIds = addOperatorDelegators( //add 2 validators to 1 operator
+        reETH.operatorRegistry,
+        address(reETH.rewardDistributor),
+        1,
+        emptyStrategyShareCaps,
+        2
+        );
+        
+        // POC is based on two cohorts, each cohort could include 1 or multiple users. 
+        // Cohort 1 is the set of users that front-run. In total they hold 31 ETH
+        // Cohort 2 is the set of cohort that do not front-run. These users hold 1 ETH
+        //
+        // I show that if cohort 1 front-runs cohort 2 after a 1 ETH slashing
+        // cohort 2 loses 100% of their assets, they were supposed to only lose only ~3%
+        
+        uint256 depositAmount = ETH_DEPOSIT_SIZE - address(reETH.depositPool).balance;  
+        reETH.coordinator.depositETH{value: depositAmount}(); 
+
+        vm.prank(EOA, EOA);
+        reETH.coordinator.rebalance(ETH_ADDRESS); 
+        uint40[] memory validatorIndices = verifyCredentialsForValidators(reETH.operatorRegistry, 1, 1);
+        
+        address delegator = reETH.operatorRegistry.getOperatorDetails(operatorIds[0]).delegator;
+        
+        // Slashing for 1 ETH and 31 ETH front-runs the update
+
+        uint256 withdrawalAmount = 31 ether;
+        reETH.coordinator.requestWithdrawal(ETH_ADDRESS, withdrawalAmount);
+        uint256 firstEpoch = reETH.withdrawalQueue.getCurrentEpoch(ETH_ADDRESS);
+
+        // Slashing is updated on EigenLayer
+        // We manually update balance to 1 to simulate the update. 
+        
+        int256 shares = RioLRTOperatorDelegator(payable(delegator)).getEigenPodShares();         
+        
+        IEigenPodManager manager = IEigenPodManager(EIGEN_POD_MANAGER_ADDRESS);
+        stdstore.target(EIGEN_POD_MANAGER_ADDRESS).sig("podOwnerShares(address)").with_key(delegator).checked_write_int(int256(shares-1 ether));
+        int256 loadInt = stdstore.target(EIGEN_POD_MANAGER_ADDRESS).sig("podOwnerShares(address)").with_key(delegator).read_int();
+
+        skip(reETH.coordinator.rebalanceDelay());
+        vm.prank(EOA, EOA);
+        reETH.coordinator.rebalance(ETH_ADDRESS);
+        
+        // Check the availalbe shares left after front-run and slashing update
+
+        shares = RioLRTOperatorDelegator(payable(delegator)).getEigenPodShares();         
+        
+        assertEq(shares,0);
+        
+        console2.log("Amount of shares available for cohort 2 after cohort 1 front-runs:", shares);
+        uint256 expectedShares = 1e18 * 31 /32;
+
+        console2.log("Amount of shares expected for cohort 2 after 1 ETH slashing:", expectedShares);
+
+    }
+
+```
+
+```
+Logs:
+  Amount of shares available for cohort 2 after cohort 1 front-runs: 0
+  Amount of shares expected for cohort 2 after 1 ETH slashing: 968750000000000000
+
+```
+
+**Czar102**
+
+I understand the impact, but, on second thoughts, given that the slashings are very rare and there are multiple safeguards and incentives set to prevent them, it makes more sense to consider this a Medium severity issue.
+
+Planning to reject the escalation and leave it as is.
+
+**Czar102**
+
+Result:
+Medium
+Has duplicates
+
+**sherlock-admin2**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [KupiaSecAdmin](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/190/#issuecomment-2023159432): rejected
+- [0xmonrel](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/190/#issuecomment-2023758478): rejected
+
+**sherlock-admin4**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/rio-org/rio-sherlock-audit/pull/13
+
+
+# Issue M-8: All operators can have ETH deposits regardless of the cap setted for them leading to miscalculated TVL 
 
 Source: https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/235 
+
+The protocol has acknowledged this issue.
 
 ## Found by 
 hash, klaus, mstpr-brainbot, neumo, zzykxx
@@ -2783,123 +2971,61 @@ This is a necessary feature, and should be a short-lived quirk. If an operator i
 
 I believe this should have been a known consideration stated in the contest details, so leaving as medium severity.
 
-# Issue M-16: Users can receive less tokens than expected due to precision loss 
+# Issue M-9: `requestWithdrawal` doesn't estimate accurately the available shares for withdrawals 
 
-Source: https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/264 
+Source: https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/361 
 
 ## Found by 
-Bauer, dany.armstrong90, itsabinashb, sobieski, thank\_you, thec00n
+Audinarey, Aymen0909, Bauer, Bony, Drynooo, cats, deepplus, hash, kennedy1030, monrel, sakshamguruji, zzykxx
 ## Summary
 
-When user makes a deposit into the RIO LRT Coordinator, the amount of due LST is calculated with a precision loss bug. As a result, the user can receive much less LST than expected.
+The `requestWithdrawal` function inaccurately estimates the available shares for withdrawals by including funds stored in the deposit pool into the already deposited EigenLayer shares. This can potentially lead to blocking withdrawals or users receiving less funds for their shares.
 
 ## Vulnerability Detail
 
-Users can deposit asset to Rio via the `RioLRTCoordinator::deposit()` method. Inside this method, the due `amountOut` of LST is calculated like this:
+For a user to withdraw funds from the protocol, they must first request a withdrawal using the `requestWithdrawal` function, which queues the withdrawal in the current epoch by calling `withdrawalQueue().queueWithdrawal`.
 
-```javascript
-amountOut = convertFromAssetToRestakingTokens(asset, amountIn);
+To evaluate the available shares for withdrawal, the function converts the protocol asset balance into shares:
+
+```solidity
+uint256 availableShares = assetRegistry().convertToSharesFromAsset(asset, assetRegistry().getTotalBalanceForAsset(asset));
 ```
 
-The method `RioLRTCoordinator::convertFromAssetToRestakingTokens()` does the following calculation:
+The issue arises from the `getTotalBalanceForAsset` function, which returns the sum of the protocol asset funds held, including assets already deposited into EigenLayer and assets still in the deposit pool:
 
-```javascript
-function convertFromAssetToRestakingTokens(address asset, uint256 amount) public view returns (uint256) {
-        uint256 value = assetRegistry().convertToUnitOfAccountFromAsset(asset, amount);
-        return convertFromUnitOfAccountToRestakingTokens(value);
+```solidity
+function getTotalBalanceForAsset(
+    address asset
+) public view returns (uint256) {
+    if (!isSupportedAsset(asset)) revert ASSET_NOT_SUPPORTED(asset);
+
+    address depositPool_ = address(depositPool());
+    if (asset == ETH_ADDRESS) {
+        return depositPool_.balance + getETHBalanceInEigenLayer();
+    }
+
+    uint256 sharesHeld = getAssetSharesHeld(asset);
+    uint256 tokensInRio = IERC20(asset).balanceOf(depositPool_);
+    uint256 tokensInEigenLayer = convertFromSharesToAsset(
+        getAssetStrategy(asset),
+        sharesHeld
+    );
+
+    return tokensInRio + tokensInEigenLayer;
 }
 ```
 
-In order to calculate the due amount of LST, the value of asset deposited by the user gets converted to ETH. Subsequently, the value in ETH gets converted to the value in LST. The first calculation of value in ETH is executed in the `RioLRTAssetRegistry::convertToUnitOfAccountFromAsset()` method:
+This causes the calculated `availableShares` to differ from the actual shares held by the protocol because the assets still in the deposit pool shouldn't be converted to shares with the current share price (shares/asset) as they were not deposited into EigenLayer yet.
 
-```javascript
-function convertToUnitOfAccountFromAsset(address asset, uint256 amount) public view returns (uint256) {
-        if (asset == ETH_ADDRESS) {
-            return amount;
-        }
-        address priceFeed = assetInfo[asset].priceFeed;
-        uint256 price = getPrice(priceFeed);
-
-        return _normalizeDecimals(price * amount / priceScale, assetInfo[asset].decimals, priceFeedDecimals);
-}
-```
-
-The math is as follows:
-
-**valueInEth = \_normalizeDecimals(price \* amount / priceScale, tokenDecimals, priceFeedDecimals)**
-
-When we investigate the `RioLRTAssetRegistry::_normalizeDecimals()` method, we can see that it multiplies or divides the argument by the difference between decimals of asset and its price feed:
-
-```javascript
-function _normalizeDecimals(uint256 amount, uint8 fromDecimals, uint8 toDecimals) internal pure returns (uint256) {
-        // No adjustment needed if decimals are the same.
-        if (fromDecimals == toDecimals) {
-            return amount;
-        }
-        // Scale down to match the target decimal precision.
-        if (fromDecimals > toDecimals) {
-            return amount / 10 ** (fromDecimals - toDecimals);
-        }
-        // Scale up to match the target decimal precision.
-        return amount * 10 ** (toDecimals - fromDecimals);
-}
-```
-
-Let's consider a scenario where the decimals of token asset (`fromDecimals`) are smaller than the decimals of price feed (`toDecimals`). As example of such a scenario will be `USDT` asset, which has 6 decimals, while its price feed has 18 decimals.
-
-The final formula for the ETH value will be then as follows:
-
-**valueInEth = (price \* amount / priceScale) \* 10 \*\* (toDecimals - fromDecimals)**
-
-Applying the `USDT` scenario decimals gives us:
-
-**valueInEth = (price \* amount / 10e18) \* 10e12**
-
-We can see a division happening before multiplication. As Solidity rounds down integer divisions, it is strongly advised to perform multiplications before divisions in order to avoid precision losses. This advice is not followed here and the calculation leads to loss of precision.
-
-The vulnerable method `RioLRTAssetRegistry::_normalizeDecimals()` is also utilized in calculating the amounts for withdrawal and calculating the TVLs. As such, the precision loss issue scope is broad as it affects multiple scenarios of interaction within the Rio protocol.
+Depending on the current shares price, the function might over or under-estimate the available shares in the protocol. This can potentially result in allowing more queued withdrawals than the available shares in the protocol, leading to blocking withdrawals later on or users receiving less funds for their shares.
 
 ## Impact
 
-The amount of LST minted for the user can be much less than expected if the deposited asset decimals are lower than price feed decimals. This scenario is likely to happen, as the documentation states:
-
-> We plan to support tokens with no less than 6 decimals and no more than 18 decimals
-
-The precision loss may also impact the amounts withdrawn from the Protocol.
-
-## Proof of concept
-
-Run the following test inside a Foundry test suite to demonstrate the precision loss:
-
-```javascript
-function test_precisionLoss(uint256 amount) public {
-        vm.assume(amount > 1e6);
-        vm.assume(amount < 1000e6);       
-
-        uint256 price = 294104713183814; //The USDT/ETH hardcoded price
-        uint256 tokenDecimals = 6;
-        uint256 priceFeedDecimals = 18;
-        uint256 priceScale = uint64(10) ** priceFeedDecimals; //10e18
-        uint256 decimalsNormalizer = uint64(10) ** (priceFeedDecimals - tokenDecimals); //10e12
-
-        uint256 priceCalculatedAsForNow = ((price * amount / priceScale) * decimalsNormalizer);
-        uint256 priceCalculatedCorrectly = ((price * amount * decimalsNormalizer) / priceScale);
-        
-        assertEq(priceCalculatedAsForNow, priceCalculatedCorrectly);
-}
-```
-
-Example of precision loss:
-
-```javascript
-Error: a == b not satisfied [uint]
-        Left: 294000000000000
-       	Right: 294105007288527
-```
+The `requestWithdrawal` function inaccurately estimates the available shares for withdrawals, potentially resulting in blocking withdrawals or users receiving less funds for their shares.
 
 ## Code Snippet
 
-https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/restaking/RioLRTAssetRegistry.sol#L195
+https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/main/rio-sherlock-audit/contracts/restaking/RioLRTCoordinator.sol#L111-L114
 
 ## Tool used
 
@@ -2907,23 +3033,21 @@ Manual Review
 
 ## Recommendation
 
-Always execute the division after the multiplications to avoid precision loss.
+There is no straightforward way to handle this issue as the asset held by the deposit pool can't be converted into shares while they were not deposited into EigenLayer. The code should be reviewed to address this issue.
 
 
 
 ## Discussion
 
-**nevillehuang**
-
-Borderline Medium/Low, leaving open for discussion, what is the maximum possible loss here?
-
 **solimander**
 
-In practice, precision losses will be dust.
+Duplicate of https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/109
 
-# Issue M-17: Slashing penalty is unfairly paid by a subset of users if a deficit is accumulated. 
+# Issue M-10: Slashing penalty is unfairly paid by a subset of users if a deficit is accumulated. 
 
 Source: https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/363 
+
+The protocol has acknowledged this issue.
 
 ## Found by 
 monrel
@@ -3209,14 +3333,415 @@ Logs:
 
 Reviewing
 
-# Issue M-18: The current idea of ​​creating reETH and accepting several different assets in it exposes RIO users to losses 
+**KupiaSecAdmin**
+
+Escalate
+
+This has to be considered as Invalid/Low basically because EigenLayer's Slashing contracts do not have any features and all paused, it also won't have any features in its upgrades as well, which means no slashing exists.
+
+**sherlock-admin2**
+
+> Escalate
+> 
+> This has to be considered as Invalid/Low basically because EigenLayer's Slashing contracts do not have any features and all paused, it also won't have any features in its upgrades as well, which means no slashing exists.
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**0xmonrel**
+
+You are misunderstanding the issue. This is about consensus layer slashing.
+
+**nevillehuang**
+
+@KupiaSecAdmin Could you link resources/proof to your argument so I can review?
+
+**KupiaSecAdmin**
+
+@nevillehuang - https://hackmd.io/@-HV50kYcRqOjl_7du8m1AA/BkOyFwc2T#Out-of-Scope
+Here's the docs about upgrades of EigenLayer, which Rio is targeting, hope it helps.
+
+@0xmonrel - If you were meant to say about Ethereum's PoS slashing, as I described [here](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/190), it should be considered as Low.
+
+**0xmonrel**
+
+The arguments does not apply here. The effect on TVL are irrelevant what matters in this issue is that only 1 cohort of users will pay for the slashing if a deficit happens.
+
+
+**nevillehuang**
+
+@solimander Based on targeted eigen layer contracts it seems it is correct that slashing is currently not applicable to Rio. It is also not stated in the contest details that this will be integrated to rio, so I believe this is invalid based on the following sherlock guideline:
+
+> Future issues: Issues that result out of a future integration/implementation that was not mentioned in the docs/README or because of a future change in the code (as a fix to another issue) are not valid issues.
+
+**0xmonrel**
+
+POS slashing is already live and integrated. Slashing from re-staking is not so it is not out of scope. 
+
+**nevillehuang**
+
+@0xmonrel Could you point me to the correct resource. This will affect validity of #190 as well
+
+**0xmonrel**
+
+Slashing  is implemented natively through the balance update process. When a validator is slashed the balance is decreased, this is then pushed to EigenLayer through `verifyBalanceUpdates()`.  
+
+Here is the logic where slashing is accounted for and a deficit can happen:
+
+https://github.com/Layr-Labs/eigenlayer-contracts/blob/e12b03f20f7dceded8de9c6901ab05cfe61a2113/src/contracts/pods/EigenPodManager.sol#L207-L219
+
+Look here at the `verifyBalanceUpdates()`
+
+https://github.com/Layr-Labs/eigenlayer-contracts/blob/b6a3a91e1c0c126981de409b00b5fba178503447/src/contracts/pods/EigenPod.sol#L175-L221
+
+Read the comment for a description of what happens when a balance is decreased. 
+
+@solimander can most likely verify that this is correct as he has deep understanding of EigenLayer.
+
+**solimander**
+
+That's right, you can find more info on the deficit edge case in the [EigenLayer discord](https://discord.com/channels/1089434273720832071/1187171025478230168/1210639477601603660): 
+
+**nevillehuang**
+
+Thanks alot guys, I believe this issue is correctly judged given the constraint of a deficit edge case.
+
+**Czar102**
+
+I'm planning to reject the escalation and leave the issue as is, unless @KupiaSecAdmin or anyone else has a valid argument not to.
+
+**Czar102**
+
+Result:
+Medium
+Unique
+
+**sherlock-admin3**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [KupiaSecAdmin](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/363/#issuecomment-2023014162): rejected
+
+**solimander**
+
+This is definitely an edge case of an edge case. First, slashing needs to occur while the withdrawal is queued. Second, the operator delegator's pod owner shares needs to be low enough that a deficit is possible. For this reason, considering leaving as-is for now and handling this out-of-protocol.
+
+# Issue M-11: ETH withdrawers do not earn yield while waiting for a withdrawal 
+
+Source: https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/370 
+
+## Found by 
+monrel, peanuts
+## Summary
+
+In the [ Rio doc](https://docs.rio.network/rio-architecture/deposits-and-withdraws) we can read the following
+
+"Users will continue to earn yield as they wait for their withdrawal request to be processed."
+
+This is not true for withdrawals in ETH since they will simply receive an equivalent to the `sharesOWed` calculated when requesting a withdrawal.
+## Vulnerability Detail
+
+When `requestWithdrawal()` is called  to withdraw ETH `sharesOwed` is calculated
+
+https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTCoordinator.sol#L101
+
+```solidity
+sharesOwed = convertToSharesFromRestakingTokens(asset, amountIn);
+```
+
+The total `sharesOwed` in ETH is added to `epcohWithdrawals.assetsReceived` if we settle with `settleCurrentEpoch()` or `settleEpochFromEigenlayer()` 
+
+Below are the places where `assetsReceived` is is set and accumulated
+
+https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTWithdrawalQueue.sol#L194
+```solidity
+epochWithdrawals.assetsReceived = SafeCast.toUint120(assetsReceived);
+```
+
+
+https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTWithdrawalQueue.sol#L162
+```solidity
+epochWithdrawals.assetsReceived = SafeCast.toUint120(assetsReceived); 
+```
+
+https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTWithdrawalQueue.sol#L268
+
+```solidity
+epochWithdrawals.assetsReceived += SafeCast.toUint120(assetsReceived);
+```
+
+when claiming rewards this is used to calculate users share
+
+https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTWithdrawalQueue.sol#L104
+
+```solidity
+amountOut = userSummary.sharesOwed.mulDiv(epochWithdrawals.assetsReceived, epochWithdrawals.sharesOwed);
+
+```
+
+
+The portion of staking rewards accumulated during withdrawal that belongs to LRT holders is never accounted for so withdrawing users do not earn any rewards when waiting for a withdrawal to be completed. 
+## Impact
+
+Since a portion of the staking reward belongs to the LRT holders and since the docs mentions that yield is accumulated while in the queue It is fair to assume that withdrawing users have a proportional claim to the yield.
+
+As shown above this is not true, users withdrawing in ETH do no earn any rewards when withdrawing.
+## Code Snippet
+
+https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTWithdrawalQueue.sol#L268
+
+https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTWithdrawalQueue.sol#L194
+
+https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTWithdrawalQueue.sol#L162
+
+https://github.com/sherlock-audit/2024-02-rio-network-core-protocol/blob/4f01e065c1ed346875cf5b05d2b43e0bcdb4c849/rio-sherlock-audit/contracts/restaking/RioLRTWithdrawalQueue.sol#L104
+
+## Tool used
+
+Manual Review
+## Recommendation
+
+Account for the accumulate rewards during the withdrawal period that belongs to the deposit pool. This can be calculated based on data in DelayedWithdrawalRouter on Eigenlayer.
+
+
+
+## Discussion
+
+**0xmonrel**
+
+Escalate
+
+I will argue that this should be a separate High issue
+
+This is not a duplicate of #109. This is an entirely different issue. What I show here is that ETH is the only asset that does not earn yield during withdrawal. The documentation clearly states that users earn yield when withdrawing:
+
+From [Rio doc](https://docs.rio.network/rio-architecture/deposits-and-withdraws) "Users will continue to earn yield as they wait for their withdrawal request to be processed."
+
+We should also consider that the time to withdrawal ETH can be longer than the EigenLayer withdrawal period depending on how many other validators are exiting.
+
+Here is the time depending on how many validators are exiting 
+
+
+![SCR-20240327-qzov](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/assets/123949319/a0a074ef-306e-41ab-bf80-c62abfe77a33)
+[source](https://figment.io/insights/ethereum-withdrawals-a-comprehensive-faq/)
+
+If there is a large outflow of exiting validators it could take weeks to even receive the withdrawal status.
+
+Every single user that withdrawals in ETH lose the yield that they are promised and would have received if they had withdrawn in another asset.
+
+I believe this fulfills the following criteria for a High "Definite loss of funds without (extensive) limitations of external conditions."
+
+**sherlock-admin2**
+
+> Escalate
+> 
+> I will argue that this should be a separate High issue
+> 
+> This is not a duplicate of #109. This is an entirely different issue. What I show here is that ETH is the only asset that does not earn yield during withdrawal. The documentation clearly states that users earn yield when withdrawing:
+> 
+> From [Rio doc](https://docs.rio.network/rio-architecture/deposits-and-withdraws) "Users will continue to earn yield as they wait for their withdrawal request to be processed."
+> 
+> We should also consider that the time to withdrawal ETH can be longer than the EigenLayer withdrawal period depending on how many other validators are exiting.
+> 
+> Here is the time depending on how many validators are exiting 
+> 
+> 
+> ![SCR-20240327-qzov](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/assets/123949319/a0a074ef-306e-41ab-bf80-c62abfe77a33)
+> [source](https://figment.io/insights/ethereum-withdrawals-a-comprehensive-faq/)
+> 
+> If there is a large outflow of exiting validators it could take weeks to even receive the withdrawal status.
+> 
+> Every single user that withdrawals in ETH lose the yield that they are promised and would have received if they had withdrawn in another asset.
+> 
+> I believe this fulfills the following criteria for a High "Definite loss of funds without (extensive) limitations of external conditions."
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**solimander**
+
+Technically valid, but would argue the loss is highly constrained in that the only loss is yield while withdrawing. I'll update the docs for this issue.
+
+**nevillehuang**
+
+I believe #177 and #367 to be duplicates of this issue
+
+**0xmonrel**
+
+#177  is not a duplicate it is about rebasing tokens.  #367 is definitely a duplicate.
+
+**nevillehuang**
+
+@solimander I am still unsure if this is not a duplicate of #109 and others. Could you elaborate more and is a separate fix required? The following impact highlighted by the watson seems to indicate otherwise. To me it seems like the same accrual inconsistency due to exchange rate used to compute sharesOwed regardless of type of asset.
+
+> The portion of staking rewards accumulated during withdrawal that belongs to LRT holders is never accounted for so withdrawing users do not earn any rewards when waiting for a withdrawal to be completed.
+
+**solimander**
+
+@nevillehuang The issues do seem slightly different, though the fix being considered will fully fix #109 and partially fix this issue.
+
+The core issue in #109 is that there's a period between the time that the shares owed is locked and the rebalance occurs in which yield to the EigenLayer strategy can cause a rebalance revert.
+
+Locking shares owed at the time of withdrawal request also affects this issue in that it prevents withdrawals from earning yield at the time the withdrawal request is received. Once a rebalance occurs, this issue has a secondary cause that prevents yield from being earned - unlike other strategies, "shares" in the beacon chain strategy are just ETH, so no additional yield can be earned once the withdrawal from EigenLayer is queued.
+
+I plan to address both with the above fix and update the docs to inform users that yield will only be earned between the time of withdrawal request and rebalance for ETH withdrawals.
+
+**0xmonrel**
+
+> @solimander I am still unsure if this is not a duplicate of #109 and others. Could you elaborate more and is a separate fix required? The following impact highlighted by the watson seems to indicate otherwise. To me it seems like the same accrual inconsistency due to exchange rate used to compute sharesOwed regardless of type of asset.
+> 
+> > The portion of staking rewards accumulated during withdrawal that belongs to LRT holders is never accounted for so withdrawing users do not earn any rewards when waiting for a withdrawal to be completed.
+
+No, that issue does not fix this one. This issue can be fixed in protocol but it would require quite a bit of added complexity to account for the correct share of yield. Solimander will instead settle on not giving out yield during the withdrawal process, which of course users needs to be aware of.
+
+@solimander have you considered that the withdrawal of ETH could take weeks or months if the POS withdrawal queue is congested? I just want to confirm that we have covered everything here. 
+
+Maybe we can add functionality to compensate users that have their assets locked for a long period of time without earning yield. E.g. if POS withdrawal takes 2 week more than the EigenLayer withdrawal the admin can issue 0-5% APY equivalent amount of yield to the cohort from the deposit pool.
+
+Just brainstorming on a fix that does not add a lot of complexity but defends against the worst case scenario..
+
+---
+
+Actually, I think there is reasonable fix that solves all this in protocol. It requires that an Oracle is used to update the cumulative yield in a single storage slot when rebalance is called. We also need to add a mapping `epoch->time` and then let ETH withdrawers take their yield directly from the deposit pool at the time of withdrawal.
+
+Solimander, I can provide an MVP for the above if you are interested. 
+
+
+
+
+
+
+
+
+
+**nevillehuang**
+
+> Locking shares owed at the time of withdrawal request also affects this issue in that it prevents withdrawals from earning yield at the time the withdrawal request is received. Once a rebalance occurs, this issue has a secondary cause that prevents yield from being earned - unlike other strategies, "shares" in the beacon chain strategy are just ETH, so no additional yield can be earned once the withdrawal from EigenLayer is queued.
+
+The secondary cause seems to not be highlighted in the original submission. I believe they are duplicates because both issues point to locking of assets (albeit different assets) within deposit pools and locking the exchange rate during deposits. I believe if exchange rate accounts for yield accrued that is supposed to be delegated to the user, both issues would be solved.
+
+**0xmonrel**
+
+> > Locking shares owed at the time of withdrawal request also affects this issue in that it prevents withdrawals from earning yield at the time the withdrawal request is received. Once a rebalance occurs, this issue has a secondary cause that prevents yield from being earned - unlike other strategies, "shares" in the beacon chain strategy are just ETH, so no additional yield can be earned once the withdrawal from EigenLayer is queued.
+> 
+> 
+> 
+> The secondary cause seems to not be highlighted in the original submission. I believe they are duplicates because both issues point to locking of assets (albeit different assets) within deposit pools and locking the exchange rate during deposits. I believe if exchange rate accounts for yield accrued that is supposed to be delegated to the user, both issues would be solved.
+
+>I believe if exchange rate accounts for yield accrued that is supposed to be delegated to users, both issues would be solved
+
+LST and ETH earn yield differently. This entire issue is on the topic of how ETH yield is not accounted for at all since it is distributed through a separate system that has nothing to do with the exchange rate. The fix to #109 does not lead to users earning yield during the withdrawal period since the yield from rebalance -> completed withdrawal is not accounted for.
+
+I am clearly referring to the secondary issue:
+
+>The portion of staking rewards accumulated during withdrawal that belongs to LRT holders is never accounted for so withdrawing users do not earn any rewards when waiting for a withdrawal to be completed. 
+
+
+**Czar102**
+
+@0xmonrel from my understanding, #109 is an issue that makes the LST not earn yield during withdrawals, while this and #367 are documentation issues about the fact that the documentation mentions that the yield is being earned during withdrawal for ETH.
+
+Such a mechanic for ETH (described in the docs) would be fundamentally flawed, so I'm not sure how to consider this finding, given that the implementation works as it should, though against the specification.
+
+@solimander @0xmonrel @nevillehuang do you agree?
+
+**0xmonrel**
+
+@Czar102 I agree with your statement other than "such a mechanic for ETH would be fundamentally flawed". Why would it not be possible to account for the ETH yield earned? It might add complexity but it is possible.
+
+And yes, fundamentally the issue is that it is stated that users earn yield during ETH withdrawals but they do not. I am assuming here that users expecting yield based on provided information but not earning any as loss off funds/yield. But its obviously your call to decide if that is a fair assumption.
+
+**nevillehuang**
+
+@Czar102 yea agree with your point for the de-deduplication. Seems like a documentation error if sponsor didn’t fix it, but would be fair to validate it based on information presented at time of audit. I will leave it up to you to decide.
+
+ #367 and #177 seems to be talking about LST though not ETH? How is the yield earned from native ETH different from LST? Also don’t users accept the exchange rate when requesting withdrawals?
+
+**Czar102**
+
+I am referencing a fundamental flaw because ETH does not earn rewards when a validator is in the withdrawal queue. This means that Rio is fundamentally unable to provide staking rewards from that period of being locked if the withdrawal is not to impact other users' rewards.
+
+@nevillehuang @0xmonrel does that make sense?
+
+Or is it the same for ETH and other LSTs?
+
+**0xmonrel**
+
+> I am referencing a fundamental flaw because ETH does not earn rewards when a validator is in the withdrawal queue. This means that Rio is fundamentally unable to provide staking rewards from that period of being locked if the withdrawal is not to impact other users' rewards.
+> 
+> @nevillehuang @0xmonrel does that make sense?
+> 
+> Or is it the same for ETH and other LSTs?
+
+That is partially correct. Until the validator gets "withdrawable" status it will still be earning yield, i posted a picture of the expected time in a picture above.  
+
+As it stand the users withdrawing are actually paying all other users the yield that the validator is generating. A user solo staking or using EigenLayer would earn yield up until their validator reaches "withdrawable status".
+
+**0xmonrel**
+
+> @Czar102 yea agree with your point for the de-deduplication. Seems like a documentation error if sponsor didn’t fix it, but would be fair to validate it based on information presented at time of audit. I will leave it up to you to decide.
+> 
+> #367 and #177 seems to be talking about LST though not ETH? How is the yield earned from native ETH different from LST? Also don’t users accept the exchange rate when requesting withdrawals?
+
+#367 Is talking about an LRT (reETH), which is the token received when depositing ETH or an LST into Rio. So the issue is about ETH withdrawals which require users to deposit reETH. It is a little confusing since the name is similar to rETH which is an LST.
+
+Each reETH can have multiple underlying assets that are supported on EigenLayer. EigenLayer distinguishes between LSTs and ETH since ETH has to be staked with an actual validator - the rewards that are generated here is the yield for ETH. These rewards are distributed through the DelayedWithdrawalRouter contract on EigenLayer. Eventually 90% reaches the deposit pool at which point the yield belongs to reETH holders. None of this is accounted for during withdrawals of ETH, that is why ETH withdrawals earn 0 yield.  
+
+For LSTs (if they are not rebasing) the yield is earned in the increased value of the token based on how much ETH it can be redeemed for which increases as yield is added.
+
+**On users accept an exchange rate:** Users accept the current value of their reETH when requesting a withdrawal but they are also expected to earn yield on top of that during the withdrawal. For non-rebasing LSTs this happens naturally since the yield is baked into the token. Locking in 10 LST today and receiving 10 LST in 1 week will include the yield. This is not true for ETH which is why no yield is earned.
+
+#107 is a separate issue that does not talk about ETH withdrawals, it is not a duplicate.
+
+**Czar102**
+
+I agree. Will make this a separate issue with #367 and #177 as duplicates shortly.
+
+**0xmonrel**
+
+#177 should not be a duplicate? It is only on rebasing tokens not earning yield
+
+Explicitly only talking about non-eth rebasing tokens:
+
+Impact section:
+>Not all depositors will be able to withdraw their assets/principal for non-ETH assets.
+
+**Czar102**
+
+I see. I will leave it a duplicate of #109, as it was, which will not change the reward distribution from the scenario where it was invalidated. cc @nevillehuang
+
+Thanks for reminding me to remove #177 from the duplicates @0xmonrel.
+
+**Czar102**
+
+Result:
+Medium
+Has Duplicates
+
+Considering this a Medium since the loss is constrained to the interest during some of the withdrawal time, which is a small part of the deposits.
+
+**sherlock-admin3**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [0xmonrel](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/370/#issuecomment-2023693079): accepted
+
+# Issue M-12: The current idea of ​​creating reETH and accepting several different assets in it exposes RIO users to losses 
 
 Source: https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/386 
 
 The protocol has acknowledged this issue.
 
 ## Found by 
-ComposableSecurity, PNS, Thanos, fugazzi, zzykxx
+ComposableSecurity, PNS, fugazzi, shaka, zzykxx
 
 ## Summary
 After the release of LRT, which will include the ability to deposit native eth and wrapped staking tokens like cbETH or wstETH, Rio users will be exposed to additional economic risks that may lead to loss of capital. In case of a predictable price drop (e.g. caused by a slashing event in an external liquid staking provider), external users can deposit their funds into Rio before the price drop. They will receive the LRT (corresponding to the value before the price drop, as priceFeed displays the changed price only when it actually happens) and withdraw them once the price drops, sharing their loss with Rio users.
