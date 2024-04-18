@@ -135,11 +135,26 @@ Valid bug - `currentEpochsByAsset[asset] += 1;` should be called in `queueCurren
 
 **sherlock-admin4**
 
-The protocol team fixed this issue in PR/commit https://github.com/rio-org/rio-sherlock-audit/pull/1.
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/rio-org/rio-sherlock-audit/pull/1
+
+
+**10xhash**
+
+> The protocol team fixed this issue in PR/commit [rio-org/rio-sherlock-audit#1](https://github.com/rio-org/rio-sherlock-audit/pull/1).
+
+Fixed
+The epoch is now incremented inside queueCurrentEpochSettlement function
+
+**sherlock-admin4**
+
+The Lead Senior Watson signed off on the fix.
 
 # Issue H-2: Setting the strategy cap to "0" does not update the total shares held or the withdrawal queue 
 
 Source: https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/10 
+
+The protocol has acknowledged this issue.
 
 ## Found by 
 Aymen0909, KupiaSec, g, hash, kennedy1030, mstpr-brainbot
@@ -373,6 +388,22 @@ Valid, but feels like it should be medium given precondition that you must be vo
 
 Since operators are not trusted in the context of rio-protocol, I believe high severity to be appropriate since this allows direct manipulation of exchange rates and can cause stuck funds within rio contracts
 
+**sherlock-admin4**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/rio-org/rio-sherlock-audit/pull/15
+
+
+**10xhash**
+
+> The protocol team fixed this issue in the following PRs/commits: [rio-org/rio-sherlock-audit#15](https://github.com/rio-org/rio-sherlock-audit/pull/15)
+
+Pausing functionality is added to reduce the impact. Operators are currently trusted wrt the undelegate functionality and further improvements will be made in upcoming versions
+
+**sherlock-admin4**
+
+The Lead Senior Watson signed off on the fix.
+
 # Issue H-4: Deposits may be front-run by malicious operator to steal ETH 
 
 Source: https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/55 
@@ -424,6 +455,15 @@ Since operators are not trusted in the context of rio-protocol, I believe high s
 The protocol team fixed this issue in the following PRs/commits:
 https://github.com/rio-org/rio-sherlock-audit/pull/12
 
+
+**10xhash**
+
+Fixed
+A guardian signature is now required to perform validator deposits. To prevent misuse of this using incorrect withdrawal credentials, now confirmed validators can also be removed
+
+**sherlock-admin4**
+
+The Lead Senior Watson signed off on the fix.
 
 # Issue H-5: swapValidatorDetails incorrectly writes keys to memory, resulting in permanently locked beacon chain deposits 
 
@@ -589,7 +629,20 @@ Note that the above change must be made for both keys.
 
 **sherlock-admin4**
 
-The protocol team fixed this issue in PR/commit https://github.com/rio-org/rio-sherlock-audit/pull/2.
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/rio-org/rio-sherlock-audit/pull/2
+
+
+**10xhash**
+
+> The protocol team fixed this issue in PR/commit [rio-org/rio-sherlock-audit#2](https://github.com/rio-org/rio-sherlock-audit/pull/2).
+
+Fixed
+Ordering is corrected as per recommendation
+
+**sherlock-admin4**
+
+The Lead Senior Watson signed off on the fix.
 
 # Issue H-6: Requested withdrawal can be impossible to settle due to EigenLayer shares value appreciate when there are idle funds in deposit pool 
 
@@ -693,6 +746,15 @@ https://github.com/rio-org/rio-sherlock-audit/pull/13
 **Czar102**
 
 For a more severe impact, see #112.
+
+**10xhash**
+
+Fixed
+The share value is now computed only at the time of rebalance hence deposit pool funds are not queued with an earlier cached rate. Risk associated with rio lrt appreciation due to increase in other assets is considered acceptable for now.
+
+**sherlock-admin4**
+
+The Lead Senior Watson signed off on the fix.
 
 # Issue H-7: `reportOutOfOrderValidatorExits` does not updates the heap order 
 
@@ -904,7 +966,20 @@ update the utilization in the reportOutOfOrderValidatorExits function
 
 **sherlock-admin4**
 
-The protocol team fixed this issue in PR/commit https://github.com/rio-org/rio-sherlock-audit/pull/10.
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/rio-org/rio-sherlock-audit/pull/10
+
+
+**10xhash**
+
+> The protocol team fixed this issue in PR/commit [rio-org/rio-sherlock-audit#10](https://github.com/rio-org/rio-sherlock-audit/pull/10).
+
+Fixed
+Heap is updated inside the reportOutOfOrderValidatorExits function
+
+**sherlock-admin4**
+
+The Lead Senior Watson signed off on the fix.
 
 # Issue H-8: Heap is incorrectly stores the removed operator ID which can lead to division by zero in deposit/withdrawal flow 
 
@@ -1158,7 +1233,9 @@ function _remove(Data memory self, uint8 i) internal pure {
 
 **sherlock-admin4**
 
-The protocol team fixed this issue in PR/commit https://github.com/rio-org/rio-sherlock-audit/pull/3.
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/rio-org/rio-sherlock-audit/pull/3
+
 
 **nevillehuang**
 
@@ -1332,6 +1409,17 @@ However, you did not accurately describe the harm caused, which is "division by 
 **solimander**
 
 I do agree that #16 does sort of miss the point as the core issue is not mentioned. The issue is not that the removed operator ID still exists in memory, but that it's not correctly removed from storage.
+
+**10xhash**
+
+> The protocol team fixed this issue in PR/commit [rio-org/rio-sherlock-audit#3](https://github.com/rio-org/rio-sherlock-audit/pull/3).
+
+Fixed
+Now all operator slots greater than the last operator is set to 0
+
+**sherlock-admin4**
+
+The Lead Senior Watson signed off on the fix.
 
 # Issue M-1: Depositing to EigenLayer can revert due to round downs in converting shares<->assets 
 
@@ -1524,7 +1612,20 @@ Manual Review
 
 **sherlock-admin4**
 
-The protocol team fixed this issue in PR/commit https://github.com/rio-org/rio-sherlock-audit/pull/11.
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/rio-org/rio-sherlock-audit/pull/11
+
+
+**10xhash**
+
+> The protocol team fixed this issue in PR/commit [rio-org/rio-sherlock-audit#11](https://github.com/rio-org/rio-sherlock-audit/pull/11).
+
+Fixed
+The check is removed. To mitigate the differences in the share allocation to operators inside rio and the actual share allocation to operators in eigenlayer, an additional function is added to sync
+
+**sherlock-admin4**
+
+The Lead Senior Watson signed off on the fix.
 
 # Issue M-2: Ether can stuck when an operators validators are removed due to an user front-running 
 
@@ -1728,7 +1829,20 @@ I believe this risk should have been mentioned in contest details, so leaving as
 
 **sherlock-admin4**
 
-The protocol team fixed this issue in PR/commit https://github.com/rio-org/rio-sherlock-audit/pull/9.
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/rio-org/rio-sherlock-audit/pull/9
+
+
+**10xhash**
+
+> The protocol team fixed this issue in PR/commit [rio-org/rio-sherlock-audit#9](https://github.com/rio-org/rio-sherlock-audit/pull/9).
+
+Fixed
+Added a function which lets the admin withdraw the entire restaked withdrawn ETH from eigenpod
+
+**sherlock-admin4**
+
+The Lead Senior Watson signed off on the fix.
 
 # Issue M-3: A part of ETH rewards can be stolen by sandwiching `claimDelayedWithdrawals()` 
 
@@ -2029,7 +2143,9 @@ This issue seems out of scope and hinges on external admin integrations. But lea
 
 **sherlock-admin4**
 
-The protocol team fixed this issue in PR/commit https://github.com/rio-org/rio-sherlock-audit/pull/6.
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/rio-org/rio-sherlock-audit/pull/6
+
 
 **10xhash**
 
@@ -2196,6 +2312,17 @@ Escalations have been resolved successfully!
 Escalation status:
 - [10xhash](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/174/#issuecomment-2024334137): rejected
 
+**10xhash**
+
+> The protocol team fixed this issue in PR/commit [rio-org/rio-sherlock-audit#6](https://github.com/rio-org/rio-sherlock-audit/pull/6).
+
+Fixed
+A function is added to manually distribute the ETH rewards rather than the receive() function itself distributing the rewards
+
+**sherlock-admin4**
+
+The Lead Senior Watson signed off on the fix.
+
 # Issue M-5: The protocol can't receive rewards because of low gas limits on ETH transfers 
 
 Source: https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/185 
@@ -2305,7 +2432,20 @@ Remove the hardcoded `10_000` gas limit in [Asset::transferETH()](https://github
 
 **sherlock-admin4**
 
-The protocol team fixed this issue in PR/commit https://github.com/rio-org/rio-sherlock-audit/pull/4.
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/rio-org/rio-sherlock-audit/pull/4
+
+
+**10xhash**
+
+> The protocol team fixed this issue in PR/commit [rio-org/rio-sherlock-audit#4](https://github.com/rio-org/rio-sherlock-audit/pull/4).
+
+Fixed
+Removed the 10k gas limit
+
+**sherlock-admin4**
+
+The Lead Senior Watson signed off on the fix.
 
 # Issue M-6: RioLRTIssuer::issueLRT reverts if deposit asset's approve method doesn't return a bool 
 
@@ -2383,7 +2523,9 @@ Use `forceApprove` from OpenZeppelin's `SafeERC20` library.
 
 **sherlock-admin4**
 
-The protocol team fixed this issue in PR/commit https://github.com/rio-org/rio-sherlock-audit/pull/5.
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/rio-org/rio-sherlock-audit/pull/5
+
 
 **mstpr**
 
@@ -2479,6 +2621,17 @@ Escalations have been resolved successfully!
 
 Escalation status:
 - [mstpr](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/189/#issuecomment-2022687170): rejected
+
+**10xhash**
+
+> The protocol team fixed this issue in PR/commit [rio-org/rio-sherlock-audit#5](https://github.com/rio-org/rio-sherlock-audit/pull/5).
+
+Fixed
+forceApprove is now used
+
+**sherlock-admin4**
+
+The Lead Senior Watson signed off on the fix.
 
 # Issue M-7: Stakers can avoid validator penalties 
 
@@ -2861,6 +3014,16 @@ The protocol team fixed this issue in the following PRs/commits:
 https://github.com/rio-org/rio-sherlock-audit/pull/13
 
 
+**10xhash**
+
+> The protocol team fixed this issue in the following PRs/commits: [rio-org/rio-sherlock-audit#13](https://github.com/rio-org/rio-sherlock-audit/pull/13)
+
+Now since the value of the rio token is only computed at the time of rebalance, if the off-chain system is able to update the slashed validators balance in eigenpod before the rebalance call, the correct price will be used
+
+**sherlock-admin4**
+
+The Lead Senior Watson signed off on the fix.
+
 # Issue M-8: All operators can have ETH deposits regardless of the cap setted for them leading to miscalculated TVL 
 
 Source: https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/235 
@@ -3042,6 +3205,23 @@ There is no straightforward way to handle this issue as the asset held by the de
 **solimander**
 
 Duplicate of https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/109
+
+**sherlock-admin4**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/rio-org/rio-sherlock-audit/pull/13
+
+
+**10xhash**
+
+> The protocol team fixed this issue in the following PRs/commits: [rio-org/rio-sherlock-audit#13](https://github.com/rio-org/rio-sherlock-audit/pull/13)
+
+Fixed
+Deposit pool funds are now converted using the share price at the time of rebalance. Fixes duplicates that mention lack of removal of (queued shares of previous epochs) from available shares. Not removing operator exit shares from available shares is considered acceptable for now.
+
+**sherlock-admin4**
+
+The Lead Senior Watson signed off on the fix.
 
 # Issue M-10: Slashing penalty is unfairly paid by a subset of users if a deficit is accumulated. 
 
@@ -3733,6 +3913,21 @@ Escalations have been resolved successfully!
 
 Escalation status:
 - [0xmonrel](https://github.com/sherlock-audit/2024-02-rio-network-core-protocol-judging/issues/370/#issuecomment-2023693079): accepted
+
+**sherlock-admin4**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/rio-org/rio-sherlock-audit/pull/13
+
+
+**10xhash**
+
+Fixed
+Share value appreciated/yield till the rebalance call will now be considered. Since the queued rio lrt tokens are only burnt after the withdrawal completion, the yield occuring during this time will be temporarily distributed to even the queued tokens causing a temporary decrease in rio lrt value. This is considered accepteable. 
+
+**sherlock-admin4**
+
+The Lead Senior Watson signed off on the fix.
 
 # Issue M-12: The current idea of ​​creating reETH and accepting several different assets in it exposes RIO users to losses 
 
